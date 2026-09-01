@@ -1,6 +1,9 @@
-use serde::{Deserialize, Serialize};
+use serde::Deserialize;
+use serde::Serialize;
 
-use super::telemetry::{EnhancedEvent, EnhancedEventFields, EnhancedEventKind};
+use super::telemetry::EnhancedEvent;
+use super::telemetry::EnhancedEventFields;
+use super::telemetry::EnhancedEventKind;
 
 /// Shared experimental prune profile. V1 does not branch on model name.
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
@@ -142,7 +145,9 @@ pub fn apply_pressure_prune(
         }
     }
     let chars_removed = surface.char_count().saturating_sub(next.char_count()) as u64;
-    next.generation = surface.generation.saturating_add(if chars_removed > 0 { 1 } else { 0 });
+    next.generation = surface
+        .generation
+        .saturating_add(if chars_removed > 0 { 1 } else { 0 });
     let after = next.estimated_tokens();
     events.push(EnhancedEvent::new(
         EnhancedEventKind::ContextPruneCompleted,
@@ -168,12 +173,21 @@ fn prune_blocks(blocks: &mut [ContentBlock], policy: ToolResultPrunePolicy) -> u
     // tool result, emitting one omitted marker. Non-text blocks stay in order.
     let total_chars: usize = blocks
         .iter()
-        .map(|block| block.text.as_deref().map(str::chars).map(Iterator::count).unwrap_or(0))
+        .map(|block| {
+            block
+                .text
+                .as_deref()
+                .map(str::chars)
+                .map(Iterator::count)
+                .unwrap_or(0)
+        })
         .sum();
     if total_chars < policy.min_text_chars {
         return 0;
     }
-    let keep = policy.keep_head_chars.saturating_add(policy.keep_tail_chars);
+    let keep = policy
+        .keep_head_chars
+        .saturating_add(policy.keep_tail_chars);
     if total_chars <= keep {
         return 0;
     }
@@ -227,7 +241,14 @@ fn item_chars(item: &SurfaceItem) -> usize {
                 + tool_type.len()
                 + blocks
                     .iter()
-                    .map(|block| block.text.as_deref().map(str::chars).map(Iterator::count).unwrap_or(0))
+                    .map(|block| {
+                        block
+                            .text
+                            .as_deref()
+                            .map(str::chars)
+                            .map(Iterator::count)
+                            .unwrap_or(0)
+                    })
                     .sum::<usize>()
         }
         SurfaceItem::Control { key, value } => key.len() + value.len(),

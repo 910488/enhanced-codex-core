@@ -191,8 +191,13 @@ async fn record_stage1_output_usage_for_memory_citation(
 /// Handle a completed output item from the model stream, recording it and
 /// queuing any tool execution futures. This records items immediately so
 /// history and rollout stay in sync even if the turn is later cancelled.
+/// `None` is the Enhanced tool-reliability port suppressing a duplicate whose
+/// original result already reached the model: that call must contribute no
+/// model-visible output at all. Upstream carries a bare envelope here; the
+/// option is reintroduced around *their* type rather than smuggling a sentinel
+/// envelope that every consumer would have to learn to ignore.
 pub(crate) type InFlightFuture<'f> =
-    Pin<Box<dyn Future<Output = Result<ResponseItemEnvelope>> + Send + 'f>>;
+    Pin<Box<dyn Future<Output = Result<Option<ResponseItemEnvelope>>> + Send + 'f>>;
 
 #[derive(Default)]
 pub(crate) struct OutputItemResult {

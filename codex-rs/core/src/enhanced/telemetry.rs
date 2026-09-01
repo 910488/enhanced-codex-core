@@ -1,5 +1,7 @@
-use serde::{Deserialize, Serialize};
-use sha2::{Digest, Sha256};
+use serde::Deserialize;
+use serde::Serialize;
+use sha2::Digest;
+use sha2::Sha256;
 
 use super::config::AblationProfile;
 
@@ -111,7 +113,10 @@ impl MemoryTelemetry {
     }
 
     pub fn count(&self, kind: EnhancedEventKind) -> usize {
-        self.events.iter().filter(|event| event.kind == kind).count()
+        self.events
+            .iter()
+            .filter(|event| event.kind == kind)
+            .count()
     }
 }
 

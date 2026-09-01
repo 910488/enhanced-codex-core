@@ -18,17 +18,23 @@ use crate::session::turn_context::TurnContext;
 use crate::tools::context::ToolPayload;
 use crate::tools::router::ToolCall;
 
-use super::bounded_continuation::{
-    ContinuationDecision, ReservedContinuation, TurnStopContext, UnfinishedSignal, CONTINUE_NUDGE,
-};
-use super::context_pruner::{ContentBlock, ModelVisibleSurface, SurfaceItem};
-use super::context_recovery::{CompactDecision, OverflowDecision};
+use super::bounded_continuation::CONTINUE_NUDGE;
+use super::bounded_continuation::ContinuationDecision;
+use super::bounded_continuation::ReservedContinuation;
+use super::bounded_continuation::TurnStopContext;
+use super::bounded_continuation::UnfinishedSignal;
+use super::context_pruner::ContentBlock;
+use super::context_pruner::ModelVisibleSurface;
+use super::context_pruner::SurfaceItem;
+use super::context_recovery::CompactDecision;
+use super::context_recovery::OverflowDecision;
 use super::hooks::HookDecision;
 use super::runtime::EnhancedSessionRuntime;
 use super::telemetry::MemoryTelemetry;
-use super::tool_reliability::{
-    AdmitDecision, ProviderToolCallIdentity, ToolCallLedger, ToolCallResolution,
-};
+use super::tool_reliability::AdmitDecision;
+use super::tool_reliability::ProviderToolCallIdentity;
+use super::tool_reliability::ToolCallLedger;
+use super::tool_reliability::ToolCallResolution;
 
 pub(crate) enum PressureSeam {
     DeferToUpstream,
@@ -46,10 +52,7 @@ pub(crate) enum OverflowSeam {
 
 fn split_runtime(
     runtime: &mut EnhancedSessionRuntime,
-) -> (
-    &mut super::hooks::EnhancedTurnHooks,
-    &mut MemoryTelemetry,
-) {
+) -> (&mut super::hooks::EnhancedTurnHooks, &mut MemoryTelemetry) {
     (&mut runtime.hooks, &mut runtime.telemetry)
 }
 
@@ -73,9 +76,31 @@ fn payload_arguments(payload: &ToolPayload) -> String {
 
 fn identity_from_call(call: &ToolCall) -> ProviderToolCallIdentity {
     let arguments = payload_arguments(&call.payload);
-    let value = serde_json::from_str::<Value>(&arguments)
-        .unwrap_or_else(|_| Value::String(arguments));
+    let value = serde_json::from_str::<Value>(&arguments).unwrap_or(Value::String(arguments));
     ToolCallLedger::identity(call.call_id.clone(), &call.tool_name.name, &value)
+}
+
+/// Sentinel `RespondToModel` payload. `ToolCallRuntime` must drop it instead
+/// of turning it into a model-visible `FunctionCallOutput`.
+pub(crate) const DROP_TOOL_OUTPUT_MARKER: &str = "vellum.enhanced.drop-tool-output";
+
+pub(crate) fn drop_tool_output_error() -> FunctionCallError {
+    FunctionCallError::RespondToModel(DROP_TOOL_OUTPUT_MARKER.to_string())
+}
+
+pub(crate) fn is_drop_tool_output(error: &FunctionCallError) -> bool {
+    matches!(
+        error,
+        FunctionCallError::RespondToModel(message) if message == DROP_TOOL_OUTPUT_MARKER
+    )
+}
+
+fn original_result_already_delivered(runtime: &EnhancedSessionRuntime, call_id: &str) -> bool {
+    runtime
+        .hooks
+        .ledger
+        .get(call_id)
+        .is_some_and(|handled| handled.original_result_delivered)
 }
 
 pub(crate) fn admit_tool_call(
@@ -93,7 +118,11 @@ pub(crate) fn admit_tool_call(
             runtime
                 .hooks
                 .mark_tool_resolution(&call.call_id, ToolCallResolution::SyntheticDuplicate);
-            Err(FunctionCallError::RespondToModel(message))
+            if original_result_already_delivered(runtime, &call.call_id) {
+                Err(drop_tool_output_error())
+            } else {
+                Err(FunctionCallError::RespondToModel(message))
+            }
         }
         HookDecision::Handled(AdmitDecision::FailClosed { message }) => {
             Err(FunctionCallError::Fatal(message))
@@ -123,9 +152,7 @@ pub(crate) fn complete_tool_call(
             HookDecision::Handled(super::tool_reliability::LateResultDecision::Suppress)
         )
     {
-        return Err(FunctionCallError::RespondToModel(format!(
-            "duplicate provider tool call {call_id} was not forwarded"
-        )));
+        return Err(drop_tool_output_error());
     }
     if let HookDecision::Handled(super::tool_reliability::LateResultDecision::Accept) = original {
         runtime.hooks.mark_tool_resolution(
@@ -239,7 +266,10 @@ pub(crate) fn response_items_to_surface(items: &[ResponseItem]) -> ModelVisibleS
 fn apply_surface_to_items(items: &mut [ResponseItem], surface: &ModelVisibleSurface) {
     let mut texts = std::collections::HashMap::new();
     for item in &surface.items {
-        if let SurfaceItem::ToolResult { call_id, blocks, .. } = item {
+        if let SurfaceItem::ToolResult {
+            call_id, blocks, ..
+        } = item
+        {
             let text = blocks
                 .iter()
                 .filter_map(|block| block.text.as_deref())
@@ -253,10 +283,10 @@ fn apply_surface_to_items(items: &mut [ResponseItem], surface: &ModelVisibleSurf
             ResponseItem::FunctionCallOutput {
                 call_id, output, ..
             } => {
-                if let Some(id) = call_id {
-                    if let Some(text) = texts.get(id) {
-                        output.body = FunctionCallOutputBody::Text(text.clone());
-                    }
+                if let Some(id) = call_id
+                    && let Some(text) = texts.get(id)
+                {
+                    output.body = FunctionCallOutputBody::Text(text.clone());
                 }
             }
             ResponseItem::CustomToolCallOutput {
@@ -273,7 +303,7 @@ fn apply_surface_to_items(items: &mut [ResponseItem], surface: &ModelVisibleSurf
 
 pub(crate) fn apply_pressure_to_prompt(
     runtime: &mut EnhancedSessionRuntime,
-    items: &mut Vec<ResponseItem>,
+    items: &mut [ResponseItem],
     context_window_tokens: u64,
     compact_threshold_tokens: u64,
 ) -> PressureSeam {
@@ -371,12 +401,13 @@ fn unfinished_from_items(items: &[ResponseItem]) -> Vec<UnfinishedSignal> {
         if name != "update_plan" {
             continue;
         }
-        if let Ok(args) = serde_json::from_str::<UpdatePlanArgs>(arguments) {
-            if args.plan.iter().any(|step| {
-                matches!(step.status, StepStatus::Pending | StepStatus::InProgress)
-            }) {
-                unfinished.push(UnfinishedSignal::NativePlanIncomplete);
-            }
+        if let Ok(args) = serde_json::from_str::<UpdatePlanArgs>(arguments)
+            && args
+                .plan
+                .iter()
+                .any(|step| matches!(step.status, StepStatus::Pending | StepStatus::InProgress))
+        {
+            unfinished.push(UnfinishedSignal::NativePlanIncomplete);
         }
         break;
     }
@@ -396,7 +427,10 @@ pub(crate) async fn maybe_continue_turn(
         unfinished: unfinished_from_items(items),
     };
     let (plan, reserved) = {
-        let mut runtime = sess.enhanced.lock().unwrap_or_else(|error| error.into_inner());
+        let mut runtime = sess
+            .enhanced
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let (hooks, telemetry) = split_runtime(&mut runtime);
         let start = telemetry.events.len();
         let decision = hooks.on_turn_stop(&context, telemetry);
@@ -420,7 +454,7 @@ pub(crate) async fn maybe_continue_turn(
             )]) else {
                 sess.enhanced
                     .lock()
-                    .unwrap_or_else(|error| error.into_inner())
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
                     .hooks
                     .release_continuation();
                 return false;
@@ -429,7 +463,7 @@ pub(crate) async fn maybe_continue_turn(
                 .await;
             sess.enhanced
                 .lock()
-                .unwrap_or_else(|error| error.into_inner())
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
                 .pending_continuation = Some(reserved);
             true
         }
@@ -441,7 +475,7 @@ pub(crate) fn commit_pending_continuation(sess: &Session) {
     let mut runtime = sess
         .enhanced
         .lock()
-        .unwrap_or_else(|error| error.into_inner());
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     let Some(reserved) = runtime.pending_continuation.take() else {
         return;
     };
@@ -454,7 +488,7 @@ pub(crate) fn release_pending_continuation(sess: &Session) {
     let mut runtime = sess
         .enhanced
         .lock()
-        .unwrap_or_else(|error| error.into_inner());
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     runtime.pending_continuation = None;
     runtime.hooks.release_continuation();
 }
@@ -464,7 +498,7 @@ pub(crate) async fn restore_ledger_if_needed(sess: &Session) {
         let runtime = sess
             .enhanced
             .lock()
-            .unwrap_or_else(|error| error.into_inner());
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         if runtime.ledger_restored || !runtime.hooks.features.qwen_tool_reliability {
             return;
         }
@@ -474,7 +508,7 @@ pub(crate) async fn restore_ledger_if_needed(sess: &Session) {
     let mut runtime = sess
         .enhanced
         .lock()
-        .unwrap_or_else(|error| error.into_inner());
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     if runtime.ledger_restored {
         return;
     }
@@ -545,9 +579,9 @@ fn ledger_from_history(items: &[ResponseItem]) -> ToolCallLedger {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use super::super::config::AblationProfile;
     use super::super::hooks::EnhancedTurnHooks;
+    use super::*;
     use codex_protocol::models::FunctionCallOutputPayload;
     use serde_json::json;
 
@@ -625,7 +659,9 @@ mod tests {
         let mut telemetry = MemoryTelemetry::default();
         let identity = ToolCallLedger::identity("c1", "shell", &json!({"a": 1}));
         assert!(matches!(
-            runtime.hooks.admit_tool_call(identity.clone(), &mut telemetry),
+            runtime
+                .hooks
+                .admit_tool_call(identity.clone(), &mut telemetry),
             HookDecision::Handled(AdmitDecision::Execute)
         ));
         assert!(matches!(
@@ -636,6 +672,8 @@ mod tests {
             .hooks
             .mark_tool_resolution("c1", ToolCallResolution::SyntheticDuplicate);
         let forwarded = complete_tool_call(&mut runtime, "c1", true);
-        assert!(forwarded.is_err());
+        assert!(is_drop_tool_output(
+            forwarded.as_ref().expect_err("late original must drop")
+        ));
     }
 }

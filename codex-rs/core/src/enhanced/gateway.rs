@@ -1,4 +1,5 @@
-use serde::{Deserialize, Serialize};
+use serde::Deserialize;
+use serde::Serialize;
 
 /// Operations a thin Vellum provider gateway may perform. Agent-loop
 /// authority stays in Codex / Enhanced Codex.

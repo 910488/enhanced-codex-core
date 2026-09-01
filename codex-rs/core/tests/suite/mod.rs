@@ -64,6 +64,7 @@ mod cyber_access_program;
 mod cyber_exec_policy;
 mod daybreak_access;
 mod deprecation_notice;
+mod enhanced_agent_loop;
 mod exec;
 mod exec_policy;
 #[cfg(not(target_os = "windows"))]

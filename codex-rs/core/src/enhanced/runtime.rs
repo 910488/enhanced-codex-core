@@ -8,7 +8,8 @@ use std::path::Path;
 use serde::Deserialize;
 
 use super::bounded_continuation::ReservedContinuation;
-use super::config::{AblationProfile, EnhancedRuntimeFeatures};
+use super::config::AblationProfile;
+use super::config::EnhancedRuntimeFeatures;
 use super::context_pruner::ModelVisibleSurface;
 use super::hooks::EnhancedTurnHooks;
 use super::telemetry::MemoryTelemetry;
@@ -56,10 +57,10 @@ impl EnhancedSessionRuntime {
 }
 
 pub fn load_features(codex_home: &Path) -> EnhancedRuntimeFeatures {
-    if let Ok(profile) = std::env::var(ABLATION_ENV) {
-        if let Some(parsed) = AblationProfile::parse(&profile) {
-            return parsed.features();
-        }
+    if let Ok(profile) = std::env::var(ABLATION_ENV)
+        && let Some(parsed) = AblationProfile::parse(&profile)
+    {
+        return parsed.features();
     }
     let path = codex_home.join(CONFIG_FILE);
     let Ok(bytes) = std::fs::read(&path) else {
@@ -97,11 +98,7 @@ mod tests {
     #[test]
     fn ablation_profile_selects_ports() {
         let dir = TempDir::new().unwrap();
-        std::fs::write(
-            dir.path().join(CONFIG_FILE),
-            r#"{"ablationProfile":"E1"}"#,
-        )
-        .unwrap();
+        std::fs::write(dir.path().join(CONFIG_FILE), r#"{"ablationProfile":"E1"}"#).unwrap();
         let features = load_features(dir.path());
         assert!(features.qwen_tool_reliability);
         assert!(!features.deepseek_context_recovery);

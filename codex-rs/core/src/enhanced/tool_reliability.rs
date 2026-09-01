@@ -1,10 +1,15 @@
 use std::collections::HashMap;
 
-use serde::{Deserialize, Serialize};
+use serde::Deserialize;
+use serde::Serialize;
 use serde_json::Value;
-use sha2::{Digest, Sha256};
+use sha2::Digest;
+use sha2::Sha256;
 
-use super::telemetry::{hash_identifier, EnhancedEvent, EnhancedEventFields, EnhancedEventKind};
+use super::telemetry::EnhancedEvent;
+use super::telemetry::EnhancedEventFields;
+use super::telemetry::EnhancedEventKind;
+use super::telemetry::hash_identifier;
 
 /// Identity of a provider-issued tool call. The ledger is owned by a Codex
 /// thread/session and must be restored on resume.
@@ -85,7 +90,11 @@ impl ToolCallLedger {
         format!("sha256:{}", hex::encode(hasher.finalize()))
     }
 
-    pub fn identity(provider_call_id: impl Into<String>, tool_name: &str, arguments: &Value) -> ProviderToolCallIdentity {
+    pub fn identity(
+        provider_call_id: impl Into<String>,
+        tool_name: &str,
+        arguments: &Value,
+    ) -> ProviderToolCallIdentity {
         let tool_name = tool_name.to_string();
         ProviderToolCallIdentity {
             argument_fingerprint: Self::fingerprint_arguments(&tool_name, arguments),
@@ -202,7 +211,8 @@ impl ToolCallLedger {
     }
 
     pub fn from_durable_json(value: &Value) -> Result<Self, LedgerError> {
-        serde_json::from_value(value.clone()).map_err(|error| LedgerError::Invalid(error.to_string()))
+        serde_json::from_value(value.clone())
+            .map_err(|error| LedgerError::Invalid(error.to_string()))
     }
 }
 
@@ -298,12 +308,24 @@ mod tests {
     fn duplicate_call_same_id_same_args_executes_once() {
         let mut ledger = ToolCallLedger::new();
         let identity = ToolCallLedger::identity("call-1", "shell", &args());
-        assert_eq!(ledger.admit(identity.clone()).decision, AdmitDecision::Execute);
+        assert_eq!(
+            ledger.admit(identity.clone()).decision,
+            AdmitDecision::Execute
+        );
         let second = ledger.admit(identity);
-        assert!(matches!(second.decision, AdmitDecision::SuppressDuplicate { .. }));
-        assert_eq!(ledger.get("call-1").unwrap().resolution, ToolCallResolution::InFlight);
+        assert!(matches!(
+            second.decision,
+            AdmitDecision::SuppressDuplicate { .. }
+        ));
+        assert_eq!(
+            ledger.get("call-1").unwrap().resolution,
+            ToolCallResolution::InFlight
+        );
         ledger.mark_resolution("call-1", ToolCallResolution::Executed);
-        assert_eq!(ledger.get("call-1").unwrap().resolution, ToolCallResolution::Executed);
+        assert_eq!(
+            ledger.get("call-1").unwrap().resolution,
+            ToolCallResolution::Executed
+        );
         assert!(!ToolCallLedger::synthetic_duplicate_result("duplicate").success());
     }
 
@@ -314,10 +336,12 @@ mod tests {
         let other = ToolCallLedger::identity("call-1", "shell", &json!({"path": "b.rs"}));
         let outcome = ledger.admit(other);
         assert!(matches!(outcome.decision, AdmitDecision::FailClosed { .. }));
-        assert!(outcome
-            .events
-            .iter()
-            .any(|event| event.kind == EnhancedEventKind::ToolCallIdCollision));
+        assert!(
+            outcome
+                .events
+                .iter()
+                .any(|event| event.kind == EnhancedEventKind::ToolCallIdCollision)
+        );
     }
 
     #[test]
@@ -347,7 +371,10 @@ mod tests {
         let restored = ToolCallLedger::from_durable_json(&ledger.to_durable_json()).unwrap();
         let mut restored = restored;
         let outcome = restored.admit(ToolCallLedger::identity("call-1", "shell", &args()));
-        assert!(matches!(outcome.decision, AdmitDecision::SuppressDuplicate { .. }));
+        assert!(matches!(
+            outcome.decision,
+            AdmitDecision::SuppressDuplicate { .. }
+        ));
     }
 
     #[test]

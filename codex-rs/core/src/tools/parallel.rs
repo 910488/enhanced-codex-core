@@ -75,17 +75,18 @@ impl ToolCallRuntime {
         self,
         call: ToolCall,
         cancellation_token: CancellationToken,
-    ) -> impl std::future::Future<Output = Result<ResponseItemEnvelope, CodexErr>> {
+    ) -> impl std::future::Future<Output = Result<Option<ResponseItemEnvelope>, CodexErr>> {
         let error_call = call.clone();
         let source = call.direct_source();
         let future = self.handle_tool_call_with_source(call, source, cancellation_token);
         async move {
             match future.await {
-                Ok(response) => Ok(response.into_response()),
+                Ok(response) => Ok(Some(response.into_response())),
                 Err(FunctionCallError::Fatal(message)) => Err(CodexErr::Fatal(message)),
-                Err(other) => Ok(ResponseItemEnvelope::new(
+                Err(other) if crate::enhanced::seams::is_drop_tool_output(&other) => Ok(None),
+                Err(other) => Ok(Some(ResponseItemEnvelope::new(
                     Self::failure_response(error_call, other).into(),
-                )),
+                ))),
             }
         }
         .in_current_span()
@@ -660,7 +661,7 @@ mod tests {
         };
         assert_eq!(
             ResponseItemEnvelope::new(expected_response.into()),
-            response
+            response.expect("cancelled tool call should produce a response")
         );
 
         let actual = records

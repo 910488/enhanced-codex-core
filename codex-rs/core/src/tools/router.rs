@@ -359,7 +359,7 @@ impl ToolRouter {
             let mut runtime = session
                 .enhanced
                 .lock()
-                .unwrap_or_else(|error| error.into_inner());
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
             crate::enhanced::seams::admit_tool_call(&mut runtime, &call)?;
         }
         let ledger_call_id = call.call_id.clone();
@@ -393,7 +393,7 @@ impl ToolRouter {
             let mut runtime = session_for_hooks
                 .enhanced
                 .lock()
-                .unwrap_or_else(|error| error.into_inner());
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
             crate::enhanced::seams::complete_tool_call(
                 &mut runtime,
                 &ledger_call_id,

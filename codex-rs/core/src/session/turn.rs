@@ -175,7 +175,7 @@ impl Drop for EnhancedIdleGuard {
             .sess
             .enhanced
             .lock()
-            .unwrap_or_else(|error| error.into_inner());
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         crate::enhanced::seams::on_turn_idle(&mut runtime);
     }
 }
@@ -194,7 +194,7 @@ pub(crate) async fn run_turn(
         let mut runtime = sess
             .enhanced
             .lock()
-            .unwrap_or_else(|error| error.into_inner());
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         crate::enhanced::seams::on_new_user_input(&mut runtime);
     }
     crate::enhanced::seams::restore_ledger_if_needed(&sess).await;
@@ -553,7 +553,7 @@ pub(crate) async fn run_turn(
                         let mut runtime = sess
                             .enhanced
                             .lock()
-                            .unwrap_or_else(|error| error.into_inner());
+                            .unwrap_or_else(std::sync::PoisonError::into_inner);
                         crate::enhanced::seams::on_assistant_success(&mut runtime);
                     }
                     let stop_outcome = run_turn_stop_hooks(
@@ -1134,7 +1134,7 @@ async fn run_pre_sampling_compact(
         let mut runtime = sess
             .enhanced
             .lock()
-            .unwrap_or_else(|error| error.into_inner());
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         crate::enhanced::seams::apply_pressure_to_prompt(
             &mut runtime,
             &mut prompt_items,
@@ -1527,7 +1527,7 @@ async fn run_sampling_request(
             let mut runtime = sess
                 .enhanced
                 .lock()
-                .unwrap_or_else(|error| error.into_inner());
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
             crate::enhanced::seams::apply_pressure_to_prompt(
                 &mut runtime,
                 &mut prompt_input,
@@ -1551,9 +1551,10 @@ async fn run_sampling_request(
             .await
             {
                 Ok(()) => {
-                    prompt_input = sess.clone_history().await.for_prompt(
-                        &step_context.settings.model_info.input_modalities,
-                    );
+                    prompt_input = sess
+                        .clone_history()
+                        .await
+                        .for_prompt(&step_context.settings.model_info.input_modalities);
                 }
                 Err(err) if matches!(err.details(), CodexErrorDetails::TurnAborted) => {
                     return Err(err);
@@ -1590,7 +1591,7 @@ async fn run_sampling_request(
                         let mut runtime = sess
                             .enhanced
                             .lock()
-                            .unwrap_or_else(|error| error.into_inner());
+                            .unwrap_or_else(std::sync::PoisonError::into_inner);
                         crate::enhanced::seams::plan_overflow_for_prompt(
                             &mut runtime,
                             &prompt.input,
@@ -1626,14 +1627,15 @@ async fn run_sampling_request(
                                 }
                                 Err(_) => return Err(err),
                             }
-                            let after_items = sess.clone_history().await.for_prompt(
-                                &step_context.settings.model_info.input_modalities,
-                            );
+                            let after_items = sess
+                                .clone_history()
+                                .await
+                                .for_prompt(&step_context.settings.model_info.input_modalities);
                             let compact_overflow = {
                                 let mut runtime = sess
                                     .enhanced
                                     .lock()
-                                    .unwrap_or_else(|error| error.into_inner());
+                                    .unwrap_or_else(std::sync::PoisonError::into_inner);
                                 crate::enhanced::seams::decide_overflow_retry(
                                     &mut runtime,
                                     &before,
@@ -2388,7 +2390,7 @@ async fn drain_in_flight(
 ) -> CodexResult<()> {
     while let Some(res) = in_flight.next().await {
         match res {
-            Ok(envelope) => {
+            Ok(Some(envelope)) => {
                 mark_thread_memory_mode_polluted_if_external_context(
                     sess.as_ref(),
                     turn_context.as_ref(),
@@ -2398,6 +2400,7 @@ async fn drain_in_flight(
                 sess.record_annotated_conversation_items(&turn_context, vec![envelope])
                     .await;
             }
+            Ok(None) => {}
             Err(err) => {
                 error_or_panic(format!("in-flight tool future failed during drain: {err}"));
             }
