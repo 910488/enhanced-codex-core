@@ -152,6 +152,21 @@ const POST_SAMPLING_TOKEN_ESTIMATE_TARGET: &str = "codex_core::post_sampling_tok
 /// - If the model sends only an assistant message, we record it in the
 ///   conversation history and consider the turn complete.
 ///
+struct EnhancedIdleGuard {
+    sess: Arc<Session>,
+}
+
+impl Drop for EnhancedIdleGuard {
+    fn drop(&mut self) {
+        let mut runtime = self
+            .sess
+            .enhanced
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        crate::enhanced::seams::on_turn_idle(&mut runtime);
+    }
+}
+
 pub(crate) async fn run_turn(
     sess: Arc<Session>,
     turn_context: Arc<TurnContext>,
@@ -159,6 +174,16 @@ pub(crate) async fn run_turn(
     prewarmed_client_session: Option<ModelClientSession>,
     cancellation_token: CancellationToken,
 ) -> CodexResult<Option<String>> {
+    let _enhanced_idle = EnhancedIdleGuard {
+        sess: Arc::clone(&sess),
+    };
+    {
+        let mut runtime = sess
+            .enhanced
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        crate::enhanced::seams::on_new_user_input(&mut runtime);
+    }
     // Record results from hooks that finished after the previous turn before this turn's user prompt.
     drain_async_hook_results(&sess, &turn_context, /*before_user_prompt*/ true).await;
 
@@ -510,6 +535,13 @@ pub(crate) async fn run_turn(
 
                 if !needs_follow_up {
                     last_agent_message = sampling_request_last_agent_message;
+                    if last_agent_message.is_some() {
+                        let mut runtime = sess
+                            .enhanced
+                            .lock()
+                            .unwrap_or_else(|error| error.into_inner());
+                        crate::enhanced::seams::on_assistant_success(&mut runtime);
+                    }
                     let stop_outcome = run_turn_stop_hooks(
                         &sess,
                         &step_context,
@@ -553,6 +585,19 @@ pub(crate) async fn run_turn(
                             )
                             .await;
                         }
+                    }
+                    if !stop_outcome.should_block
+                        && crate::enhanced::seams::maybe_continue_turn(
+                            &sess,
+                            turn_context.as_ref(),
+                            &sampling_request_input,
+                            &cancellation_token,
+                            /*user_steer_pending*/ false,
+                        )
+                        .await
+                    {
+                        stop_hook_active = true;
+                        continue;
                     }
                     if stop_outcome.should_stop {
                         break;
@@ -1061,8 +1106,35 @@ async fn run_pre_sampling_compact(
     let token_status =
         super::context_window::context_window_token_status(sess.as_ref(), turn_context.as_ref())
             .await;
+    let window = token_status.full_context_window_limit.unwrap_or(0).max(0) as u64;
+    let threshold = token_status
+        .auto_compact_scope_limit
+        .or(token_status.full_context_window_limit)
+        .unwrap_or(0)
+        .max(0) as u64;
+    let mut prompt_items = sess
+        .clone_history()
+        .await
+        .for_prompt(&turn_context.model_info().input_modalities);
+    let pressure = {
+        let mut runtime = sess
+            .enhanced
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        crate::enhanced::seams::apply_pressure_to_prompt(
+            &mut runtime,
+            &mut prompt_items,
+            window,
+            threshold,
+        )
+    };
+    let should_compact = match pressure {
+        crate::enhanced::seams::PressureSeam::DeferToUpstream => token_status.token_limit_reached,
+        crate::enhanced::seams::PressureSeam::SkipNativeCompact => false,
+        crate::enhanced::seams::PressureSeam::RunNativeCompact => true,
+    };
     // Compact if the configured auto-compaction budget or usable context window is exhausted.
-    if token_status.token_limit_reached {
+    if should_compact {
         // Pre-turn compaction runs before run_turn creates the normal sampling step.
         let step_context = sess
             .capture_step_context(Arc::clone(turn_context), cancellation_token)
@@ -1422,6 +1494,29 @@ async fn run_sampling_request(
         {
             codex_protocol::models::bound_executed_tool_calls_for_prompt(&mut prompt_input);
         }
+        let token_status = super::context_window::context_window_token_status(
+            sess.as_ref(),
+            turn_context.as_ref(),
+        )
+        .await;
+        let window = token_status.full_context_window_limit.unwrap_or(0).max(0) as u64;
+        let threshold = token_status
+            .auto_compact_scope_limit
+            .or(token_status.full_context_window_limit)
+            .unwrap_or(0)
+            .max(0) as u64;
+        {
+            let mut runtime = sess
+                .enhanced
+                .lock()
+                .unwrap_or_else(|error| error.into_inner());
+            let _ = crate::enhanced::seams::apply_pressure_to_prompt(
+                &mut runtime,
+                &mut prompt_input,
+                window,
+                threshold,
+            );
+        }
         let prompt = build_prompt(
             prompt_input,
             step_context.as_ref(),
@@ -1446,7 +1541,26 @@ async fn run_sampling_request(
             Err(err) => match err.details() {
                 CodexErrorDetails::ContextWindowExceeded => {
                     sess.set_total_tokens_full(&turn_context).await;
-                    return Err(err);
+                    let mut retry_items = prompt.input.clone();
+                    let overflow = {
+                        let mut runtime = sess
+                            .enhanced
+                            .lock()
+                            .unwrap_or_else(|error| error.into_inner());
+                        crate::enhanced::seams::plan_overflow_for_prompt(
+                            &mut runtime,
+                            &mut retry_items,
+                            window,
+                            cancellation_token.is_cancelled(),
+                        )
+                    };
+                    match overflow {
+                        crate::enhanced::seams::OverflowSeam::Retry { pruned } => {
+                            initial_input = Some(pruned);
+                            continue;
+                        }
+                        _ => return Err(err),
+                    }
                 }
                 CodexErrorDetails::UsageLimitReached(e) => {
                     let rate_limits = e.rate_limits.clone();

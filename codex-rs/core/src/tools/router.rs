@@ -355,6 +355,15 @@ impl ToolRouter {
         source: ToolCallSource,
         terminal_outcome_reached: Option<Arc<AtomicBool>>,
     ) -> Result<AnyToolResult, FunctionCallError> {
+        {
+            let mut runtime = session
+                .enhanced
+                .lock()
+                .unwrap_or_else(|error| error.into_inner());
+            crate::enhanced::seams::admit_tool_call(&mut runtime, &call)?;
+        }
+        let ledger_call_id = call.call_id.clone();
+        let session_for_hooks = Arc::clone(&session);
         let ToolCall {
             tool_name,
             call_id,
@@ -376,9 +385,22 @@ impl ToolRouter {
             payload,
         };
 
-        self.registry
+        let result = self
+            .registry
             .dispatch_any_with_terminal_outcome(invocation, terminal_outcome_reached)
-            .await
+            .await;
+        {
+            let mut runtime = session_for_hooks
+                .enhanced
+                .lock()
+                .unwrap_or_else(|error| error.into_inner());
+            crate::enhanced::seams::complete_tool_call(
+                &mut runtime,
+                &ledger_call_id,
+                result.is_ok(),
+            );
+        }
+        result
     }
 }
 

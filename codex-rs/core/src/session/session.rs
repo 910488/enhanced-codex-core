@@ -75,6 +75,7 @@ pub(crate) struct Session {
     pub(super) fork_persistence: ForkPersistence,
     pub(super) forked_from_ordinal_exclusive: Option<u64>,
     pub(super) next_internal_sub_id: AtomicU64,
+    pub(crate) enhanced: std::sync::Mutex<crate::enhanced::runtime::EnhancedSessionRuntime>,
 }
 
 #[derive(Clone)]
@@ -1515,6 +1516,11 @@ impl Session {
                 fork_persistence,
                 forked_from_ordinal_exclusive,
                 next_internal_sub_id: AtomicU64::new(0),
+                enhanced: std::sync::Mutex::new(
+                    crate::enhanced::runtime::EnhancedSessionRuntime::load(
+                        session_configuration.codex_home.as_path(),
+                    ),
+                ),
             });
             if let Some(network_policy_decider_session) = network_policy_decider_session {
                 let mut guard = network_policy_decider_session.write().await;
