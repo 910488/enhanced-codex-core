@@ -197,6 +197,7 @@ pub(crate) async fn run_turn(
             .unwrap_or_else(|error| error.into_inner());
         crate::enhanced::seams::on_new_user_input(&mut runtime);
     }
+    crate::enhanced::seams::restore_ledger_if_needed(&sess).await;
     // Record results from hooks that finished after the previous turn before this turn's user prompt.
     drain_async_hook_results(&sess, &turn_context, /*before_user_prompt*/ true).await;
 
@@ -1522,17 +1523,43 @@ async fn run_sampling_request(
             .or(token_status.full_context_window_limit)
             .unwrap_or(0)
             .max(0) as u64;
-        {
+        let pressure = {
             let mut runtime = sess
                 .enhanced
                 .lock()
                 .unwrap_or_else(|error| error.into_inner());
-            let _ = crate::enhanced::seams::apply_pressure_to_prompt(
+            crate::enhanced::seams::apply_pressure_to_prompt(
                 &mut runtime,
                 &mut prompt_input,
                 window,
                 threshold,
-            );
+            )
+        };
+        if matches!(
+            pressure,
+            crate::enhanced::seams::PressureSeam::RunNativeCompact
+        ) {
+            match run_auto_compact(
+                &sess,
+                Arc::clone(&step_context),
+                /*fallback_step_context*/ None,
+                client_session,
+                InitialContextInjection::DoNotInject,
+                CompactionReason::ContextLimit,
+                CompactionPhase::MidTurn,
+            )
+            .await
+            {
+                Ok(()) => {
+                    prompt_input = sess.clone_history().await.for_prompt(
+                        &step_context.settings.model_info.input_modalities,
+                    );
+                }
+                Err(err) if matches!(err.details(), CodexErrorDetails::TurnAborted) => {
+                    return Err(err);
+                }
+                Err(_) => {}
+            }
         }
         let prompt = build_prompt(
             prompt_input,
@@ -1577,7 +1604,7 @@ async fn run_sampling_request(
                             continue;
                         }
                         crate::enhanced::seams::OverflowSeam::NeedsNativeCompact { before } => {
-                            run_auto_compact(
+                            match run_auto_compact(
                                 &sess,
                                 Arc::clone(&step_context),
                                 /*fallback_step_context*/ None,
@@ -1586,7 +1613,19 @@ async fn run_sampling_request(
                                 CompactionReason::ContextLimit,
                                 CompactionPhase::MidTurn,
                             )
-                            .await?;
+                            .await
+                            {
+                                Ok(()) => {}
+                                Err(compact_err)
+                                    if matches!(
+                                        compact_err.details(),
+                                        CodexErrorDetails::TurnAborted
+                                    ) =>
+                                {
+                                    return Err(compact_err);
+                                }
+                                Err(_) => return Err(err),
+                            }
                             let after_items = sess.clone_history().await.for_prompt(
                                 &step_context.settings.model_info.input_modalities,
                             );

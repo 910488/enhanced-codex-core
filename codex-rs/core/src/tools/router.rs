@@ -355,7 +355,6 @@ impl ToolRouter {
         source: ToolCallSource,
         terminal_outcome_reached: Option<Arc<AtomicBool>>,
     ) -> Result<AnyToolResult, FunctionCallError> {
-        crate::enhanced::seams::restore_ledger_if_needed(&session).await;
         {
             let mut runtime = session
                 .enhanced
@@ -390,7 +389,7 @@ impl ToolRouter {
             .registry
             .dispatch_any_with_terminal_outcome(invocation, terminal_outcome_reached)
             .await;
-        {
+        let complete = {
             let mut runtime = session_for_hooks
                 .enhanced
                 .lock()
@@ -399,9 +398,12 @@ impl ToolRouter {
                 &mut runtime,
                 &ledger_call_id,
                 result.is_ok(),
-            );
+            )
+        };
+        match complete {
+            Ok(()) => result,
+            Err(error) => Err(error),
         }
-        result
     }
 }
 

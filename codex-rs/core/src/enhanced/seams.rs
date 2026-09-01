@@ -105,26 +105,43 @@ pub(crate) fn complete_tool_call(
     runtime: &mut EnhancedSessionRuntime,
     call_id: &str,
     succeeded: bool,
-) {
-    match runtime.hooks.complete_original_tool_result(call_id) {
-        HookDecision::Handled(super::tool_reliability::LateResultDecision::Suppress) => {
-            let _ = runtime.hooks.ingest_late_tool_result(call_id);
-        }
-        HookDecision::Handled(super::tool_reliability::LateResultDecision::Accept) => {
-            runtime.hooks.mark_tool_resolution(
-                call_id,
-                if succeeded {
-                    ToolCallResolution::Executed
-                } else {
-                    ToolCallResolution::Failed
-                },
-            );
-        }
-        HookDecision::DeferToUpstream => {}
+) -> Result<(), FunctionCallError> {
+    let synthetic_duplicate = runtime
+        .hooks
+        .ledger
+        .get(call_id)
+        .is_some_and(|handled| handled.synthetic_duplicate_emitted);
+    let late = runtime.hooks.ingest_late_tool_result(call_id);
+    let original = runtime.hooks.complete_original_tool_result(call_id);
+    if synthetic_duplicate
+        || matches!(
+            late,
+            HookDecision::Handled(super::tool_reliability::LateResultDecision::Suppress)
+        )
+        || matches!(
+            original,
+            HookDecision::Handled(super::tool_reliability::LateResultDecision::Suppress)
+        )
+    {
+        return Err(FunctionCallError::RespondToModel(format!(
+            "duplicate provider tool call {call_id} was not forwarded"
+        )));
     }
+    if let HookDecision::Handled(super::tool_reliability::LateResultDecision::Accept) = original {
+        runtime.hooks.mark_tool_resolution(
+            call_id,
+            if succeeded {
+                ToolCallResolution::Executed
+            } else {
+                ToolCallResolution::Failed
+            },
+        );
+    }
+    Ok(())
 }
 
 pub(crate) fn on_new_user_input(runtime: &mut EnhancedSessionRuntime) {
+    runtime.pending_continuation = None;
     runtime.hooks.on_new_user_input();
 }
 
@@ -133,6 +150,7 @@ pub(crate) fn on_assistant_success(runtime: &mut EnhancedSessionRuntime) {
 }
 
 pub(crate) fn on_turn_idle(runtime: &mut EnhancedSessionRuntime) {
+    runtime.pending_continuation = None;
     runtime.hooks.on_turn_idle();
 }
 
@@ -523,4 +541,101 @@ fn ledger_from_history(items: &[ResponseItem]) -> ToolCallLedger {
         }
     }
     ledger
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use super::super::config::AblationProfile;
+    use super::super::hooks::EnhancedTurnHooks;
+    use codex_protocol::models::FunctionCallOutputPayload;
+    use serde_json::json;
+
+    fn call_item(call_id: &str, arguments: &str) -> ResponseItem {
+        ResponseItem::FunctionCall {
+            id: None,
+            name: "shell".into(),
+            namespace: None,
+            arguments: arguments.into(),
+            encrypted_function_args: None,
+            call_id: call_id.into(),
+            internal_chat_message_metadata_passthrough: None,
+        }
+    }
+
+    fn output_item(call_id: &str) -> ResponseItem {
+        ResponseItem::FunctionCallOutput {
+            id: None,
+            call_id: Some(call_id.into()),
+            name: Some("shell".into()),
+            namespace: None,
+            output: FunctionCallOutputPayload::from_text("ok".into()),
+            internal_chat_message_metadata_passthrough: None,
+        }
+    }
+
+    #[test]
+    fn empty_history_first_call_executes() {
+        let mut ledger = ledger_from_history(&[]);
+        let identity = ToolCallLedger::identity("c1", "shell", &json!({"a": 1}));
+        let outcome = ledger.admit(identity);
+        assert!(matches!(outcome.decision, AdmitDecision::Execute));
+    }
+
+    #[test]
+    fn first_original_result_is_forwarded() {
+        let mut runtime = EnhancedSessionRuntime::all_off();
+        runtime.hooks = EnhancedTurnHooks::new(AblationProfile::E1.features());
+        let mut telemetry = MemoryTelemetry::default();
+        let identity = ToolCallLedger::identity("c1", "shell", &json!({"a": 1}));
+        assert!(matches!(
+            runtime.hooks.admit_tool_call(identity, &mut telemetry),
+            HookDecision::Handled(AdmitDecision::Execute)
+        ));
+        assert!(complete_tool_call(&mut runtime, "c1", true).is_ok());
+    }
+
+    #[test]
+    fn restored_completed_call_is_not_reexecuted() {
+        let arguments = json!({"a": 1}).to_string();
+        let mut ledger = ledger_from_history(&[call_item("c1", &arguments), output_item("c1")]);
+        let identity = ToolCallLedger::identity("c1", "shell", &json!({"a": 1}));
+        let outcome = ledger.admit(identity);
+        assert!(matches!(
+            outcome.decision,
+            AdmitDecision::SuppressDuplicate { .. }
+        ));
+    }
+
+    #[test]
+    fn pending_continuation_clears_on_idle_and_new_input() {
+        let mut runtime = EnhancedSessionRuntime::all_off();
+        runtime.pending_continuation = Some(ReservedContinuation { index: 1 });
+        on_turn_idle(&mut runtime);
+        assert!(runtime.pending_continuation.is_none());
+        runtime.pending_continuation = Some(ReservedContinuation { index: 1 });
+        on_new_user_input(&mut runtime);
+        assert!(runtime.pending_continuation.is_none());
+    }
+
+    #[test]
+    fn late_original_after_synthetic_duplicate_is_not_forwarded() {
+        let mut runtime = EnhancedSessionRuntime::all_off();
+        runtime.hooks = EnhancedTurnHooks::new(AblationProfile::E1.features());
+        let mut telemetry = MemoryTelemetry::default();
+        let identity = ToolCallLedger::identity("c1", "shell", &json!({"a": 1}));
+        assert!(matches!(
+            runtime.hooks.admit_tool_call(identity.clone(), &mut telemetry),
+            HookDecision::Handled(AdmitDecision::Execute)
+        ));
+        assert!(matches!(
+            runtime.hooks.admit_tool_call(identity, &mut telemetry),
+            HookDecision::Handled(AdmitDecision::SuppressDuplicate { .. })
+        ));
+        runtime
+            .hooks
+            .mark_tool_resolution("c1", ToolCallResolution::SyntheticDuplicate);
+        let forwarded = complete_tool_call(&mut runtime, "c1", true);
+        assert!(forwarded.is_err());
+    }
 }
