@@ -152,6 +152,19 @@ const POST_SAMPLING_TOKEN_ESTIMATE_TARGET: &str = "codex_core::post_sampling_tok
 /// - If the model sends only an assistant message, we record it in the
 ///   conversation history and consider the turn complete.
 ///
+struct PendingContinuationGuard {
+    sess: Arc<Session>,
+    disarm: bool,
+}
+
+impl Drop for PendingContinuationGuard {
+    fn drop(&mut self) {
+        if !self.disarm {
+            crate::enhanced::seams::release_pending_continuation(&self.sess);
+        }
+    }
+}
+
 struct EnhancedIdleGuard {
     sess: Arc<Session>,
 }
@@ -1479,6 +1492,10 @@ async fn run_sampling_request(
     let mut initial_input = Some(input);
     let mut original_input = None;
     let mut executed_tool_calls_by_output = HashMap::new();
+    let mut continuation_guard = PendingContinuationGuard {
+        sess: Arc::clone(&sess),
+        disarm: false,
+    };
     loop {
         let prompt_input = if let Some(input) = initial_input.take() {
             input
@@ -1536,12 +1553,12 @@ async fn run_sampling_request(
         .await
         {
             Ok(output) => {
+                continuation_guard.disarm = true;
                 return Ok((output, original_input.unwrap_or(prompt.input)));
             }
             Err(err) => match err.details() {
                 CodexErrorDetails::ContextWindowExceeded => {
                     sess.set_total_tokens_full(&turn_context).await;
-                    let mut retry_items = prompt.input.clone();
                     let overflow = {
                         let mut runtime = sess
                             .enhanced
@@ -1549,7 +1566,7 @@ async fn run_sampling_request(
                             .unwrap_or_else(|error| error.into_inner());
                         crate::enhanced::seams::plan_overflow_for_prompt(
                             &mut runtime,
-                            &mut retry_items,
+                            &prompt.input,
                             window,
                             cancellation_token.is_cancelled(),
                         )
@@ -1558,6 +1575,40 @@ async fn run_sampling_request(
                         crate::enhanced::seams::OverflowSeam::Retry { pruned } => {
                             initial_input = Some(pruned);
                             continue;
+                        }
+                        crate::enhanced::seams::OverflowSeam::NeedsNativeCompact { before } => {
+                            run_auto_compact(
+                                &sess,
+                                Arc::clone(&step_context),
+                                /*fallback_step_context*/ None,
+                                client_session,
+                                InitialContextInjection::DoNotInject,
+                                CompactionReason::ContextLimit,
+                                CompactionPhase::MidTurn,
+                            )
+                            .await?;
+                            let after_items = sess.clone_history().await.for_prompt(
+                                &step_context.settings.model_info.input_modalities,
+                            );
+                            let compact_overflow = {
+                                let mut runtime = sess
+                                    .enhanced
+                                    .lock()
+                                    .unwrap_or_else(|error| error.into_inner());
+                                crate::enhanced::seams::decide_overflow_retry(
+                                    &mut runtime,
+                                    &before,
+                                    &after_items,
+                                    cancellation_token.is_cancelled(),
+                                )
+                            };
+                            match compact_overflow {
+                                crate::enhanced::seams::OverflowSeam::Retry { pruned } => {
+                                    initial_input = Some(pruned);
+                                    continue;
+                                }
+                                _ => return Err(err),
+                            }
                         }
                         _ => return Err(err),
                     }
@@ -2384,6 +2435,7 @@ async fn try_run_sampling_request(
         .instrument(trace_span!("stream_request"))
         .or_cancel(&cancellation_token)
         .await??;
+    crate::enhanced::seams::commit_pending_continuation(&sess);
     let mut in_flight: FuturesOrdered<InFlightFuture<'static>> = FuturesOrdered::new();
     let mut needs_follow_up = false;
     let mut last_agent_message: Option<String> = None;

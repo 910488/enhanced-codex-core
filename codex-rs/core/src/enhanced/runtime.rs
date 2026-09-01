@@ -7,6 +7,7 @@ use std::path::Path;
 
 use serde::Deserialize;
 
+use super::bounded_continuation::ReservedContinuation;
 use super::config::{AblationProfile, EnhancedRuntimeFeatures};
 use super::context_pruner::ModelVisibleSurface;
 use super::hooks::EnhancedTurnHooks;
@@ -28,6 +29,8 @@ pub struct EnhancedSessionRuntime {
     pub hooks: EnhancedTurnHooks,
     pub telemetry: MemoryTelemetry,
     pub last_surface: Option<ModelVisibleSurface>,
+    pub pending_continuation: Option<ReservedContinuation>,
+    pub ledger_restored: bool,
 }
 
 impl EnhancedSessionRuntime {
@@ -36,6 +39,8 @@ impl EnhancedSessionRuntime {
             hooks: EnhancedTurnHooks::new(load_features(codex_home.as_ref())),
             telemetry: MemoryTelemetry::default(),
             last_surface: None,
+            pending_continuation: None,
+            ledger_restored: false,
         }
     }
 
@@ -44,6 +49,8 @@ impl EnhancedSessionRuntime {
             hooks: EnhancedTurnHooks::new(EnhancedRuntimeFeatures::all_off()),
             telemetry: MemoryTelemetry::default(),
             last_surface: None,
+            pending_continuation: None,
+            ledger_restored: false,
         }
     }
 }

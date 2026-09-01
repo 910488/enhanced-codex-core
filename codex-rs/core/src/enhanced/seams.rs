@@ -19,7 +19,7 @@ use crate::tools::context::ToolPayload;
 use crate::tools::router::ToolCall;
 
 use super::bounded_continuation::{
-    ContinuationDecision, TurnStopContext, UnfinishedSignal, CONTINUE_NUDGE,
+    ContinuationDecision, ReservedContinuation, TurnStopContext, UnfinishedSignal, CONTINUE_NUDGE,
 };
 use super::context_pruner::{ContentBlock, ModelVisibleSurface, SurfaceItem};
 use super::context_recovery::{CompactDecision, OverflowDecision};
@@ -39,6 +39,7 @@ pub(crate) enum PressureSeam {
 pub(crate) enum OverflowSeam {
     DeferToUpstream,
     Retry { pruned: Vec<ResponseItem> },
+    NeedsNativeCompact { before: ModelVisibleSurface },
     PreserveOriginalError,
     Cancelled,
 }
@@ -105,15 +106,22 @@ pub(crate) fn complete_tool_call(
     call_id: &str,
     succeeded: bool,
 ) {
-    let _ = runtime.hooks.complete_original_tool_result(call_id);
-    runtime.hooks.mark_tool_resolution(
-        call_id,
-        if succeeded {
-            ToolCallResolution::Executed
-        } else {
-            ToolCallResolution::Failed
-        },
-    );
+    match runtime.hooks.complete_original_tool_result(call_id) {
+        HookDecision::Handled(super::tool_reliability::LateResultDecision::Suppress) => {
+            let _ = runtime.hooks.ingest_late_tool_result(call_id);
+        }
+        HookDecision::Handled(super::tool_reliability::LateResultDecision::Accept) => {
+            runtime.hooks.mark_tool_resolution(
+                call_id,
+                if succeeded {
+                    ToolCallResolution::Executed
+                } else {
+                    ToolCallResolution::Failed
+                },
+            );
+        }
+        HookDecision::DeferToUpstream => {}
+    }
 }
 
 pub(crate) fn on_new_user_input(runtime: &mut EnhancedSessionRuntime) {
@@ -284,44 +292,49 @@ pub(crate) fn apply_pressure_to_prompt(
 
 pub(crate) fn plan_overflow_for_prompt(
     runtime: &mut EnhancedSessionRuntime,
-    items: &mut Vec<ResponseItem>,
+    sent_items: &[ResponseItem],
     context_window_tokens: u64,
     cancelled: bool,
 ) -> OverflowSeam {
-    let before = runtime
-        .last_surface
-        .clone()
-        .unwrap_or_else(|| response_items_to_surface(items));
-    let mut after_items = items.clone();
+    let before = response_items_to_surface(sent_items);
+    let mut candidate = sent_items.to_vec();
     match apply_pressure_to_prompt(
         runtime,
-        &mut after_items,
+        &mut candidate,
         context_window_tokens,
         context_window_tokens,
     ) {
-        PressureSeam::DeferToUpstream => return OverflowSeam::DeferToUpstream,
-        PressureSeam::SkipNativeCompact | PressureSeam::RunNativeCompact => {}
+        PressureSeam::DeferToUpstream => OverflowSeam::DeferToUpstream,
+        PressureSeam::SkipNativeCompact => {
+            decide_overflow_retry(runtime, &before, &candidate, cancelled)
+        }
+        PressureSeam::RunNativeCompact => OverflowSeam::NeedsNativeCompact { before },
     }
-    let after = runtime
-        .last_surface
-        .clone()
-        .unwrap_or_else(|| response_items_to_surface(&after_items));
+}
+
+pub(crate) fn decide_overflow_retry(
+    runtime: &mut EnhancedSessionRuntime,
+    before: &ModelVisibleSurface,
+    after_items: &[ResponseItem],
+    cancelled: bool,
+) -> OverflowSeam {
+    let mut after = response_items_to_surface(after_items);
+    if after.char_count() < before.char_count() && after.generation <= before.generation {
+        after.generation = before.generation.saturating_add(1);
+    }
     let decision = {
         let (hooks, telemetry) = split_runtime(runtime);
         let start = telemetry.events.len();
-        let decision = hooks.plan_overflow(&before, &after, cancelled, telemetry);
+        let decision = hooks.plan_overflow(before, &after, cancelled, telemetry);
         log_new_events(telemetry, start);
         decision
     };
     match decision {
         HookDecision::DeferToUpstream => OverflowSeam::DeferToUpstream,
         HookDecision::Handled(plan) => match plan.decision {
-            OverflowDecision::Retry { .. } => {
-                *items = after_items;
-                OverflowSeam::Retry {
-                    pruned: items.clone(),
-                }
-            }
+            OverflowDecision::Retry { .. } => OverflowSeam::Retry {
+                pruned: after_items.to_vec(),
+            },
             OverflowDecision::PreserveOriginalError => OverflowSeam::PreserveOriginalError,
             OverflowDecision::Cancelled => OverflowSeam::Cancelled,
         },
@@ -396,23 +409,118 @@ pub(crate) async fn maybe_continue_turn(
             };
             sess.record_response_item_and_emit_turn_item(turn_context, item)
                 .await;
-            if sess
-                .enhanced
+            sess.enhanced
                 .lock()
                 .unwrap_or_else(|error| error.into_inner())
-                .hooks
-                .commit_continuation(reserved)
-                .is_err()
-            {
-                sess.enhanced
-                    .lock()
-                    .unwrap_or_else(|error| error.into_inner())
-                    .hooks
-                    .release_continuation();
-                return false;
-            }
+                .pending_continuation = Some(reserved);
             true
         }
         _ => false,
     }
+}
+
+pub(crate) fn commit_pending_continuation(sess: &Session) {
+    let mut runtime = sess
+        .enhanced
+        .lock()
+        .unwrap_or_else(|error| error.into_inner());
+    let Some(reserved) = runtime.pending_continuation.take() else {
+        return;
+    };
+    if runtime.hooks.commit_continuation(reserved).is_err() {
+        runtime.hooks.release_continuation();
+    }
+}
+
+pub(crate) fn release_pending_continuation(sess: &Session) {
+    let mut runtime = sess
+        .enhanced
+        .lock()
+        .unwrap_or_else(|error| error.into_inner());
+    runtime.pending_continuation = None;
+    runtime.hooks.release_continuation();
+}
+
+pub(crate) async fn restore_ledger_if_needed(sess: &Session) {
+    {
+        let runtime = sess
+            .enhanced
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        if runtime.ledger_restored || !runtime.hooks.features.qwen_tool_reliability {
+            return;
+        }
+    }
+    let history = sess.clone_history().await;
+    let items = history.raw_items().cloned().collect::<Vec<_>>();
+    let mut runtime = sess
+        .enhanced
+        .lock()
+        .unwrap_or_else(|error| error.into_inner());
+    if runtime.ledger_restored {
+        return;
+    }
+    runtime.hooks.ledger = ledger_from_history(&items);
+    runtime.ledger_restored = true;
+}
+
+fn ledger_from_history(items: &[ResponseItem]) -> ToolCallLedger {
+    let mut ledger = ToolCallLedger::new();
+    for item in items {
+        match item {
+            ResponseItem::FunctionCall {
+                call_id,
+                name,
+                arguments,
+                ..
+            } => {
+                let value = serde_json::from_str::<Value>(arguments)
+                    .unwrap_or_else(|_| Value::String(arguments.clone()));
+                let identity = ToolCallLedger::identity(call_id.clone(), name, &value);
+                let _ = ledger.admit(identity);
+            }
+            ResponseItem::CustomToolCall {
+                call_id,
+                name,
+                input,
+                ..
+            } => {
+                let value = serde_json::from_str::<Value>(input)
+                    .unwrap_or_else(|_| Value::String(input.clone()));
+                let identity = ToolCallLedger::identity(call_id.clone(), name, &value);
+                let _ = ledger.admit(identity);
+            }
+            ResponseItem::FunctionCallOutput {
+                call_id, output, ..
+            } => {
+                let Some(call_id) = call_id else {
+                    continue;
+                };
+                let _ = ledger.complete_original(call_id);
+                ledger.mark_resolution(
+                    call_id,
+                    if output.success == Some(false) {
+                        ToolCallResolution::Failed
+                    } else {
+                        ToolCallResolution::Executed
+                    },
+                );
+            }
+            ResponseItem::CustomToolCallOutput {
+                call_id, output, ..
+            } => {
+                let _ = ledger.complete_original(call_id);
+                ledger.mark_resolution(
+                    call_id,
+                    if output.success == Some(false) {
+                        ToolCallResolution::Failed
+                    } else {
+                        ToolCallResolution::Executed
+                    },
+                );
+            }
+            _ => {}
+        }
+    }
+    ledger
 }
