@@ -5,11 +5,11 @@
 // the TUI or the tracing stack).
 #![deny(clippy::print_stdout, clippy::print_stderr)]
 
-mod enhanced;
 mod apply_patch;
 mod apps;
 mod client;
 mod client_common;
+mod enhanced;
 mod realtime_context;
 mod realtime_conversation;
 mod realtime_history;
