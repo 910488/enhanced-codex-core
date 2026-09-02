@@ -216,6 +216,30 @@ impl ThreadScopedOutgoingMessageSender {
 }
 
 impl OutgoingMessageSender {
+    pub(crate) async fn send_raw_notification_to_connection(
+        &self,
+        connection_id: ConnectionId,
+        notification: serde_json::Value,
+    ) {
+        let _ = self
+            .sender
+            .send(OutgoingEnvelope::ToConnection {
+                connection_id,
+                message: OutgoingMessage::RawNotification(notification),
+                write_complete_tx: None,
+            })
+            .await;
+    }
+
+    pub(crate) async fn send_raw_notification(&self, notification: serde_json::Value) {
+        let _ = self
+            .sender
+            .send(OutgoingEnvelope::Broadcast {
+                message: OutgoingMessage::RawNotification(notification),
+            })
+            .await;
+    }
+
     pub(crate) fn new(
         sender: mpsc::Sender<OutgoingEnvelope>,
         analytics_events_client: AnalyticsEventsClient,

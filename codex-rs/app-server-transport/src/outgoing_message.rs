@@ -6,6 +6,7 @@ use codex_app_server_protocol::RequestId;
 use codex_app_server_protocol::ServerNotificationEnvelope;
 use codex_app_server_protocol::ServerRequest;
 use serde::Serialize;
+use serde_json::Value;
 use tokio::sync::oneshot;
 
 /// Stable identifier for a transport connection.
@@ -23,6 +24,8 @@ impl fmt::Display for ConnectionId {
 #[serde(untagged)]
 #[allow(clippy::large_enum_variant)]
 pub enum OutgoingMessage {
+    /// Fork-private JSON-RPC notification consumed by a supervising bridge.
+    RawNotification(Value),
     Request(ServerRequest),
     /// AppServerNotification is specific to the case where this is run as an
     /// "app server" as opposed to an MCP server.

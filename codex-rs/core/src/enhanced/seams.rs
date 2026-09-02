@@ -58,6 +58,7 @@ fn split_runtime(
 
 fn log_new_events(telemetry: &MemoryTelemetry, start: usize) {
     for event in telemetry.events.iter().skip(start) {
+        super::reporting::publish_event(event);
         tracing::info!(
             target: "codex_enhanced",
             event = event.name.as_str(),

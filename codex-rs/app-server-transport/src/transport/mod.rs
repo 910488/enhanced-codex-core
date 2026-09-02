@@ -339,6 +339,23 @@ mod tests {
     }
 
     #[test]
+    fn serialize_raw_notification_preserves_fork_private_wire_shape() {
+        let message = OutgoingMessage::RawNotification(json!({
+            "method": "vellum/enhancedRuntimeIdentity",
+            "params": { "runtimeDigest": "sha256:test" },
+        }));
+
+        let json = serialize_outgoing_message(message).expect("message should serialize");
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&json).expect("message should be valid JSON"),
+            json!({
+                "method": "vellum/enhancedRuntimeIdentity",
+                "params": { "runtimeDigest": "sha256:test" },
+            })
+        );
+    }
+
+    #[test]
     fn serialize_typed_response_preserves_wire_shape() {
         let message = OutgoingMessage::Response(OutgoingResponse {
             id: RequestId::Integer(7),

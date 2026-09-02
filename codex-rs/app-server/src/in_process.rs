@@ -653,6 +653,11 @@ async fn start_uninitialized(args: InProcessStartArgs) -> IoResult<InProcessClie
                     };
                     let outgoing_message = queued_message.message;
                     match outgoing_message {
+                        OutgoingMessage::RawNotification(_) => {
+                            // Fork-private bridge telemetry has no typed
+                            // in-process API surface and is intentionally
+                            // consumed only by the stdio bridge.
+                        }
                         OutgoingMessage::Response(response) => {
                             if let Some(response_tx) = pending_request_responses.remove(&response.id) {
                                 let result = serde_json::to_value(response.result).map_err(|err| {

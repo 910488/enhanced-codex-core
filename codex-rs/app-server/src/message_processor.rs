@@ -447,6 +447,22 @@ impl MessageProcessor {
             config_warnings.clone(),
             rpc_transport,
         );
+        if let Some(mut enhanced_reports) = codex_core::enhanced::subscribe() {
+            let enhanced_outgoing = outgoing.clone();
+            tokio::spawn(async move {
+                loop {
+                    match enhanced_reports.recv().await {
+                        Ok(notification) => {
+                            enhanced_outgoing.send_raw_notification(notification).await;
+                        }
+                        Err(tokio::sync::broadcast::error::RecvError::Lagged(skipped)) => {
+                            tracing::warn!(skipped, "enhanced telemetry notifications lagged");
+                        }
+                        Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+                    }
+                }
+            });
+        }
         let marketplace_processor = MarketplaceRequestProcessor::new(
             Arc::clone(&config),
             config_manager.clone(),

@@ -150,6 +150,12 @@ impl InitializeRequestProcessor {
             .send_response(connection_request_id, response)
             .await;
 
+        if let Some(identity) = codex_core::enhanced::identity_from_environment() {
+            self.outgoing
+                .send_raw_notification_to_connection(connection_id, identity)
+                .await;
+        }
+
         if let Some(outbound_initialized) = outbound_initialized {
             outbound_initialized.store(true, Ordering::Release);
             return Ok(true);
