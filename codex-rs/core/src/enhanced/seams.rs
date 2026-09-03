@@ -12,6 +12,7 @@ use codex_protocol::plan_tool::UpdatePlanArgs;
 use serde_json::Value;
 use tokio_util::sync::CancellationToken;
 
+use crate::context_manager::estimate_item_token_count;
 use crate::function_tool::FunctionCallError;
 use crate::session::session::Session;
 use crate::session::turn_context::TurnContext;
@@ -195,6 +196,14 @@ fn content_text(content: &[ContentItem]) -> String {
         .join("\n")
 }
 
+/// Build the pruner's view of the conversation, carrying Codex's own token
+/// estimate for every item it produces.
+///
+/// The pruner cannot recompute that number: it sees decoded text, while Codex
+/// counts the serialized item and applies per-modality adjustments, so an image
+/// or any other base64 payload is worth far less to Codex than its bytes
+/// suggest. Passing the estimate down keeps one authority for "how big is this"
+/// instead of two that disagree exactly where the disagreement is largest.
 pub(crate) fn response_items_to_surface(items: &[ResponseItem]) -> ModelVisibleSurface {
     let mut surface = ModelVisibleSurface::default();
     for item in items {
@@ -259,6 +268,12 @@ pub(crate) fn response_items_to_surface(items: &[ResponseItem]) -> ModelVisibleS
                 }],
             }),
             _ => {}
+        }
+        // An item maps to one surface item or none; keep the two vectors in
+        // step whichever it was, so index N always describes item N.
+        let estimate = u64::try_from(estimate_item_token_count(item)).unwrap_or(0);
+        while surface.item_token_estimates.len() < surface.items.len() {
+            surface.item_token_estimates.push(Some(estimate));
         }
     }
     surface
@@ -368,7 +383,7 @@ pub(crate) fn decide_overflow_retry(
     cancelled: bool,
 ) -> OverflowSeam {
     let mut after = response_items_to_surface(after_items);
-    if after.char_count() < before.char_count() && after.generation <= before.generation {
+    if after.byte_count() < before.byte_count() && after.generation <= before.generation {
         after.generation = before.generation.saturating_add(1);
     }
     let decision = {

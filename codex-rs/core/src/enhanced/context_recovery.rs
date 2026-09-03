@@ -1,10 +1,7 @@
-use super::context_pruner::ModelVisibleSurface;
-use super::context_pruner::PruneOutcome;
-use super::context_pruner::ToolResultPrunePolicy;
-use super::context_pruner::apply_pressure_prune;
-use super::telemetry::EnhancedEvent;
-use super::telemetry::EnhancedEventFields;
-use super::telemetry::EnhancedEventKind;
+use super::context_pruner::{
+    apply_pressure_prune, ModelVisibleSurface, PruneOutcome, ToolResultPrunePolicy,
+};
+use super::telemetry::{EnhancedEvent, EnhancedEventFields, EnhancedEventKind};
 
 pub const MAX_CONTEXT_OVERFLOW_RETRIES: u8 = 1;
 
@@ -40,7 +37,7 @@ pub fn plan_context_pressure(
             EnhancedEventFields {
                 before_token_estimate: Some(prune.before_token_estimate),
                 after_token_estimate: Some(prune.after_token_estimate),
-                chars_removed: Some(prune.chars_removed),
+                chars_removed: Some(prune.bytes_removed),
                 ..EnhancedEventFields::default()
             },
         ));
@@ -94,7 +91,7 @@ pub fn plan_overflow_retry(
     if attempt.retries_used >= MAX_CONTEXT_OVERFLOW_RETRIES {
         return refused(attempt.retries_used);
     }
-    let shrunk = after.char_count() < before.char_count();
+    let shrunk = after.byte_count() < before.byte_count();
     let progressed = after.generation > attempt.generation_before;
     if shrunk && progressed {
         let retry_index = attempt.retries_used.saturating_add(1);
@@ -106,9 +103,7 @@ pub fn plan_overflow_retry(
                     retry_index: Some(retry_index),
                     before_token_estimate: Some(before.estimated_tokens()),
                     after_token_estimate: Some(after.estimated_tokens()),
-                    chars_removed: Some(
-                        before.char_count().saturating_sub(after.char_count()) as u64
-                    ),
+                    chars_removed: Some(before.byte_count().saturating_sub(after.byte_count()) as u64),
                     ..EnhancedEventFields::default()
                 },
             )],
@@ -132,12 +127,12 @@ fn refused(retry_index: u8) -> OverflowPlan {
 
 #[cfg(test)]
 mod tests {
-    use super::super::context_pruner::ContentBlock;
-    use super::super::context_pruner::SurfaceItem;
     use super::*;
+    use super::super::context_pruner::{ContentBlock, SurfaceItem};
 
     fn surface(chars: usize, generation: u64) -> ModelVisibleSurface {
         ModelVisibleSurface {
+            item_token_estimates: Vec::new(),
             generation,
             items: vec![
                 SurfaceItem::ToolCall {
@@ -163,9 +158,9 @@ mod tests {
     fn pressure_prune_can_avoid_compaction() {
         let policy = ToolResultPrunePolicy {
             trigger_ratio: 0.01,
-            min_text_chars: 20,
-            keep_head_chars: 8,
-            keep_tail_chars: 8,
+            min_text_bytes: 20,
+            keep_head_bytes: 8,
+            keep_tail_bytes: 8,
         };
         let plan = plan_context_pressure(&surface(8_000, 1), policy, 100, 2_000);
         assert!(plan.prune.rewritten);
@@ -177,9 +172,9 @@ mod tests {
     fn pressure_prune_then_native_compact() {
         let policy = ToolResultPrunePolicy {
             trigger_ratio: 0.01,
-            min_text_chars: 20,
-            keep_head_chars: 3_000,
-            keep_tail_chars: 3_000,
+            min_text_bytes: 20,
+            keep_head_bytes: 3_000,
+            keep_tail_bytes: 3_000,
         };
         let plan = plan_context_pressure(&surface(8_000, 1), policy, 100, 10);
         assert_eq!(plan.compact, CompactDecision::RunNativeCodexLocalCompact);

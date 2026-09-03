@@ -1,7 +1,5 @@
-use serde::Deserialize;
-use serde::Serialize;
-use sha2::Digest;
-use sha2::Sha256;
+use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 
 use super::config::AblationProfile;
 
@@ -96,10 +94,34 @@ const FORBIDDEN_FIELD_NAMES: &[&str] = &[
 ];
 
 pub fn field_name_is_forbidden(name: &str) -> bool {
-    let normalized = name.trim().to_ascii_lowercase().replace('-', "_");
+    let normalized = normalize_field_name(name);
     FORBIDDEN_FIELD_NAMES
         .iter()
         .any(|forbidden| normalized.contains(forbidden))
+}
+
+/// The forbidden list is written in snake_case, but the wire format is
+/// camelCase — so `toolOutput` has to normalize to `tool_output` or the guard
+/// only catches the spelling nobody sends.
+fn normalize_field_name(name: &str) -> String {
+    let characters = name.trim().replace('-', "_").chars().collect::<Vec<_>>();
+    let mut normalized = String::with_capacity(characters.len() + 4);
+    for (index, character) in characters.iter().enumerate() {
+        let previous = index.checked_sub(1).and_then(|index| characters.get(index));
+        let next = characters.get(index + 1);
+        let starts_word = character.is_ascii_uppercase()
+            && previous.is_some_and(|previous| {
+                previous.is_ascii_lowercase()
+                    || previous.is_ascii_digit()
+                    || (previous.is_ascii_uppercase()
+                        && next.is_some_and(char::is_ascii_lowercase))
+            });
+        if starts_word && !normalized.ends_with('_') {
+            normalized.push('_');
+        }
+        normalized.push(character.to_ascii_lowercase());
+    }
+    normalized
 }
 
 #[derive(Debug, Default)]
@@ -113,10 +135,7 @@ impl MemoryTelemetry {
     }
 
     pub fn count(&self, kind: EnhancedEventKind) -> usize {
-        self.events
-            .iter()
-            .filter(|event| event.kind == kind)
-            .count()
+        self.events.iter().filter(|event| event.kind == kind).count()
     }
 }
 
@@ -134,6 +153,12 @@ mod tests {
         assert_ne!(hash_identifier("thread-1"), "thread-1");
         assert!(field_name_is_forbidden("Authorization"));
         assert!(field_name_is_forbidden("rawPrompt"));
+        // camelCase is the wire spelling; the guard has to catch it too.
+        assert!(field_name_is_forbidden("toolOutput"));
+        assert!(field_name_is_forbidden("apiKey"));
+        assert!(field_name_is_forbidden("APIKey"));
         assert!(!field_name_is_forbidden("request_index"));
+        assert!(!field_name_is_forbidden("beforeTokenEstimate"));
+        assert!(!field_name_is_forbidden("threadIdHash"));
     }
 }

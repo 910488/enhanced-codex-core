@@ -1,7 +1,5 @@
-use serde::Deserialize;
-use serde::Serialize;
-use sha2::Digest;
-use sha2::Sha256;
+use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 
 use super::config::EnhancedRuntimeFeatures;
 
@@ -34,7 +32,9 @@ pub fn is_pinned_git_sha(value: &str) -> bool {
 }
 
 pub fn is_sha256_digest(value: &str) -> bool {
-    let value = value.strip_prefix("sha256:").unwrap_or(value);
+    let value = value
+        .strip_prefix("sha256:")
+        .unwrap_or(value);
     value.len() == 64 && value.bytes().all(|byte| byte.is_ascii_hexdigit())
 }
 
@@ -86,21 +86,9 @@ impl DigestInputs {
 pub fn compute_runtime_digest(inputs: &DigestInputs) -> Result<String, DigestError> {
     inputs.validate()?;
     let mut hasher = Sha256::new();
-    feed(
-        &mut hasher,
-        "codexUpstreamCommit",
-        &inputs.codex_upstream_commit,
-    );
-    feed(
-        &mut hasher,
-        "enhancedCodexCommit",
-        &inputs.enhanced_codex_commit,
-    );
-    feed(
-        &mut hasher,
-        "qwenCodeSourceCommit",
-        &inputs.qwen_source_commit,
-    );
+    feed(&mut hasher, "codexUpstreamCommit", &inputs.codex_upstream_commit);
+    feed(&mut hasher, "enhancedCodexCommit", &inputs.enhanced_codex_commit);
+    feed(&mut hasher, "qwenCodeSourceCommit", &inputs.qwen_source_commit);
     feed(
         &mut hasher,
         "deepseekHarnessSourceCommit",
@@ -133,7 +121,11 @@ pub fn compute_runtime_digest(inputs: &DigestInputs) -> Result<String, DigestErr
 }
 
 fn bool_flag(value: bool) -> &'static str {
-    if value { "1" } else { "0" }
+    if value {
+        "1"
+    } else {
+        "0"
+    }
 }
 
 fn feed(hasher: &mut Sha256, key: &str, value: &str) {
@@ -155,12 +147,10 @@ mod tests {
             qwen_source_commit: "cccccccccccccccccccccccccccccccccccccccc".into(),
             deepseek_source_commit: "dddddddddddddddddddddddddddddddddddddddd".into(),
             feature_defaults: EnhancedRuntimeFeatures::all_on(),
-            app_server_protocol_hash:
-                "sha256:eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee".into(),
+            app_server_protocol_hash: "sha256:eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee".into(),
             build_profile: "enhanced-mvp-v1".into(),
             target_triple: "x86_64-pc-windows-msvc".into(),
-            artifact_sha256:
-                "sha256:ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff".into(),
+            artifact_sha256: "sha256:ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff".into(),
         }
     }
 

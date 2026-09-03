@@ -1,5 +1,4 @@
-use serde::Deserialize;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 /// Independent feature gates. Eval must select these explicitly; model names
 /// never imply a hidden profile.
@@ -112,12 +111,7 @@ mod tests {
         assert_eq!(AblationProfile::parse("qwen"), None);
         assert_eq!(AblationProfile::parse("deepseek"), None);
         assert_eq!(AblationProfile::parse("grok"), None);
-        assert!(
-            AblationProfile::parse("e5")
-                .unwrap()
-                .features()
-                .any_enabled()
-        );
+        assert_eq!(AblationProfile::parse("e5").unwrap().features().any_enabled(), true);
         assert!(!AblationProfile::E0.features().any_enabled());
     }
 }

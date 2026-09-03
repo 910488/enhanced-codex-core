@@ -1,27 +1,19 @@
 use serde_json::Value;
 
-use super::bounded_continuation::AutoContinuationBudget;
-use super::bounded_continuation::ContinuationPlan;
-use super::bounded_continuation::ReservedContinuation;
-use super::bounded_continuation::TurnStopContext;
-use super::bounded_continuation::commit_continuation;
-use super::bounded_continuation::plan_turn_stop;
-use super::bounded_continuation::release_continuation;
+use super::bounded_continuation::{
+    commit_continuation, plan_turn_stop, release_continuation, AutoContinuationBudget,
+    ContinuationPlan, ReservedContinuation, TurnStopContext,
+};
 use super::config::EnhancedRuntimeFeatures;
-use super::context_pruner::ModelVisibleSurface;
-use super::context_pruner::ToolResultPrunePolicy;
-use super::context_recovery::OverflowAttempt;
-use super::context_recovery::OverflowPlan;
-use super::context_recovery::PressurePlan;
-use super::context_recovery::plan_context_pressure;
-use super::context_recovery::plan_overflow_retry;
+use super::context_pruner::{ModelVisibleSurface, ToolResultPrunePolicy};
+use super::context_recovery::{
+    plan_context_pressure, plan_overflow_retry, OverflowAttempt, OverflowPlan, PressurePlan,
+};
 use super::telemetry::MemoryTelemetry;
-use super::tool_reliability::AdmitDecision;
-use super::tool_reliability::LateResultDecision;
-use super::tool_reliability::ProviderToolCallIdentity;
-use super::tool_reliability::ToolCallLedger;
-use super::tool_reliability::ToolCallResolution;
-use super::tool_reliability::ToolReliabilityOutcome;
+use super::tool_reliability::{
+    AdmitDecision, LateResultDecision, ProviderToolCallIdentity, ToolCallLedger,
+    ToolCallResolution, ToolReliabilityOutcome,
+};
 
 /// When a feature is off the hook must not invent a Codex decision. The
 /// caller falls through to unmodified upstream behavior.
@@ -187,10 +179,7 @@ impl EnhancedTurnHooks {
         release_continuation(&mut self.continuation);
     }
 
-    pub fn restore_ledger(
-        &mut self,
-        value: &Value,
-    ) -> Result<(), super::tool_reliability::LedgerError> {
+    pub fn restore_ledger(&mut self, value: &Value) -> Result<(), super::tool_reliability::LedgerError> {
         self.ledger = ToolCallLedger::from_durable_json(value)?;
         Ok(())
     }
@@ -198,11 +187,10 @@ impl EnhancedTurnHooks {
 
 #[cfg(test)]
 mod tests {
-    use super::super::config::AblationProfile;
-    use super::super::context_recovery::OverflowDecision;
-    use super::super::context_recovery::OverflowPlan;
-    use super::super::tool_reliability::ToolCallLedger;
     use super::*;
+    use super::super::config::AblationProfile;
+    use super::super::context_recovery::{OverflowDecision, OverflowPlan};
+    use super::super::tool_reliability::ToolCallLedger;
     use serde_json::json;
 
     #[test]
@@ -243,10 +231,12 @@ mod tests {
         let mut hooks = EnhancedTurnHooks::new(AblationProfile::E2.features());
         let mut telemetry = MemoryTelemetry::default();
         let before = ModelVisibleSurface {
+            item_token_estimates: Vec::new(),
             generation: 1,
             items: vec![],
         };
         let after = ModelVisibleSurface {
+            item_token_estimates: Vec::new(),
             generation: 2,
             items: vec![],
         };
