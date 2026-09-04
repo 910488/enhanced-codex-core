@@ -1,11 +1,16 @@
-use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
+
+use serde::Deserialize;
+use serde::Serialize;
 
 use super::config::EnhancedRuntimeFeatures;
-use super::digest::{
-    compute_runtime_digest, is_pinned_git_sha, is_sha256_digest, DigestError, DigestInputs,
-};
+use super::digest::DigestError;
+use super::digest::DigestInputs;
+use super::digest::compute_runtime_digest;
+use super::digest::is_pinned_git_sha;
+use super::digest::is_sha256_digest;
 
-pub const LOCKFILE_SCHEMA_VERSION: u32 = 1;
+pub const LOCKFILE_SCHEMA_VERSION: u32 = 2;
 pub const BUILD_PROFILE_ENHANCED_MVP_V1: &str = "enhanced-mvp-v1";
 
 /// Pinned source revisions for the Enhanced Codex MVP. These must not drift
@@ -16,6 +21,12 @@ pub const DEEPSEEK_HARNESS_SOURCE_COMMIT: &str = "dd6322d604e00eec1ba5e0c8541159
 /// Codex app-server schema pin shipped in this repository.
 pub const APP_SERVER_PROTOCOL_HASH: &str =
     "sha256:0d00aee4fbb8c9de8634c05234acf535f9998ec7fa0b0ba07f37b748e31ee0b5";
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct EnhancedRuntimeArtifact {
+    pub artifact_sha256: String,
+}
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -32,6 +43,8 @@ pub struct EnhancedRuntimeLockFile {
     pub artifact_sha256: Option<String>,
     #[serde(default)]
     pub target_triple: Option<String>,
+    #[serde(default)]
+    pub artifacts: BTreeMap<String, EnhancedRuntimeArtifact>,
 }
 
 impl EnhancedRuntimeLockFile {
@@ -46,6 +59,7 @@ impl EnhancedRuntimeLockFile {
             build_profile: BUILD_PROFILE_ENHANCED_MVP_V1.into(),
             artifact_sha256: None,
             target_triple: None,
+            artifacts: BTreeMap::new(),
         }
     }
 
@@ -56,12 +70,15 @@ impl EnhancedRuntimeLockFile {
     }
 
     pub fn validate(&self) -> Result<(), LockFileError> {
-        if self.schema_version != LOCKFILE_SCHEMA_VERSION {
+        if !matches!(self.schema_version, 1 | LOCKFILE_SCHEMA_VERSION) {
             return Err(LockFileError::UnsupportedSchema(self.schema_version));
         }
         for (name, value) in [
             ("codexUpstreamCommit", self.codex_upstream_commit.as_str()),
-            ("qwenCodeSourceCommit", self.qwen_code_source_commit.as_str()),
+            (
+                "qwenCodeSourceCommit",
+                self.qwen_code_source_commit.as_str(),
+            ),
             (
                 "deepseekHarnessSourceCommit",
                 self.deepseek_harness_source_commit.as_str(),
@@ -69,10 +86,10 @@ impl EnhancedRuntimeLockFile {
         ] {
             require_git_sha(name, value)?;
         }
-        if let Some(commit) = self.enhanced_codex_commit.as_deref() {
-            if !commit.trim().is_empty() {
-                require_git_sha("enhancedCodexCommit", commit)?;
-            }
+        if let Some(commit) = self.enhanced_codex_commit.as_deref()
+            && !commit.trim().is_empty()
+        {
+            require_git_sha("enhancedCodexCommit", commit)?;
         }
         if self.app_server_protocol_hash.trim().is_empty() {
             return Err(LockFileError::EmptyField("appServerProtocolHash"));
@@ -85,15 +102,44 @@ impl EnhancedRuntimeLockFile {
                 value: self.build_profile.clone(),
             });
         }
-        if let Some(artifact) = self.artifact_sha256.as_deref() {
-            if !artifact.trim().is_empty() && !is_sha256_digest(artifact) {
+        if let Some(artifact) = self.artifact_sha256.as_deref()
+            && !artifact.trim().is_empty()
+            && !is_sha256_digest(artifact)
+        {
+            return Err(LockFileError::InvalidDigest {
+                field: "artifactSha256",
+                value: artifact.to_string(),
+            });
+        }
+        for artifact in self.artifacts.values() {
+            if !is_sha256_digest(&artifact.artifact_sha256) {
                 return Err(LockFileError::InvalidDigest {
-                    field: "artifactSha256",
-                    value: artifact.to_string(),
+                    field: "artifacts.*.artifactSha256",
+                    value: artifact.artifact_sha256.clone(),
                 });
             }
         }
         Ok(())
+    }
+
+    pub fn artifact_for_target(&self, target_triple: &str) -> Option<&str> {
+        if let Some(artifact) = self.artifacts.get(target_triple) {
+            return Some(&artifact.artifact_sha256);
+        }
+        if self.artifacts.is_empty() && self.target_triple.as_deref() == Some(target_triple) {
+            return self.artifact_sha256.as_deref();
+        }
+        None
+    }
+
+    pub fn identity_complete_for_target(&self, target_triple: &str) -> bool {
+        matches!(
+            self.enhanced_codex_commit.as_deref(),
+            Some(value) if is_pinned_git_sha(value)
+        ) && matches!(
+            self.artifact_for_target(target_triple),
+            Some(value) if is_sha256_digest(value)
+        )
     }
 
     pub fn identity_complete(&self) -> bool {
@@ -119,9 +165,9 @@ impl EnhancedRuntimeLockFile {
             .as_deref()
             .filter(|value| !value.is_empty())
             .ok_or(DigestError::Incomplete("enhancedCodexCommit"))?;
+        let target_triple = target_triple.into();
         let artifact = self
-            .artifact_sha256
-            .as_deref()
+            .artifact_for_target(&target_triple)
             .filter(|value| !value.is_empty())
             .ok_or(DigestError::Incomplete("artifactSha256"))?;
         let inputs = DigestInputs {
@@ -132,7 +178,7 @@ impl EnhancedRuntimeLockFile {
             feature_defaults,
             app_server_protocol_hash: self.app_server_protocol_hash.clone(),
             build_profile: self.build_profile.clone(),
-            target_triple: target_triple.into(),
+            target_triple,
             artifact_sha256: artifact.to_string(),
         };
         inputs.validate()?;
@@ -208,8 +254,30 @@ mod tests {
     fn incomplete_identity_cannot_form_a_digest() {
         let lock = EnhancedRuntimeLockFile::mvp_pins();
         assert!(!lock.identity_complete());
-        assert!(lock
-            .runtime_digest(EnhancedRuntimeFeatures::all_on(), "x86_64-pc-windows-msvc")
-            .is_err());
+        assert!(
+            lock.runtime_digest(EnhancedRuntimeFeatures::all_on(), "x86_64-pc-windows-msvc")
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn resolves_artifact_by_target() {
+        let mut lock = EnhancedRuntimeLockFile::mvp_pins();
+        lock.enhanced_codex_commit = Some("b".repeat(40));
+        lock.artifacts.insert(
+            "aarch64-apple-darwin".into(),
+            EnhancedRuntimeArtifact {
+                artifact_sha256:
+                    "sha256:ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"
+                        .into(),
+            },
+        );
+
+        assert!(lock.identity_complete_for_target("aarch64-apple-darwin"));
+        assert!(!lock.identity_complete_for_target("x86_64-pc-windows-msvc"));
+        assert!(
+            lock.runtime_digest(EnhancedRuntimeFeatures::all_on(), "aarch64-apple-darwin")
+                .is_ok()
+        );
     }
 }
