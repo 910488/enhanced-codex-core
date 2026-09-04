@@ -31,13 +31,13 @@ jobs:
       - name: Check out pinned source
         uses: actions/checkout@v4
 
-      - name: Install Rust
-        uses: dtolnay/rust-toolchain@stable
+      - name: Install pinned Rust toolchain
+        uses: dtolnay/rust-toolchain@1.95.0
         with:
           targets: ${{ matrix.target }}
 
       - name: Ensure target standard library is installed
-        run: rustup target add ${{ matrix.target }}
+        run: rustup target add --toolchain 1.95.0 ${{ matrix.target }}
 
       - name: Cache Rust build
         uses: Swatinem/rust-cache@v2
