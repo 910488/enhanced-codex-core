@@ -44,6 +44,10 @@ jobs:
         with:
           workspaces: codex-rs
           key: vellum-${{ matrix.target }}
+          # The Codex workspace is an hour of compute before this job reaches
+          # its first artifact. A failure in a later step should not throw that
+          # away and make the next attempt pay for it again.
+          cache-on-failure: true
 
       - name: Build Codex core
         working-directory: codex-rs
@@ -53,6 +57,17 @@ jobs:
         if: runner.os == 'Windows'
         working-directory: codex-rs
         run: cargo build --release --locked --target ${{ matrix.target }} -p codex-windows-sandbox --bin codex-windows-sandbox-setup --bin codex-command-runner
+
+      # `codex-code-mode-runtime` turns on the v8 crate's `v8_enable_sandbox`
+      # feature, and denoland publishes no prebuilt archive for that variant.
+      # Codex publishes its own; without this step the next step 404s and tells
+      # you to build V8 from source.
+      - name: Resolve Codex-built V8 artifacts
+        shell: bash
+        run: |
+          python=python3
+          command -v python3 >/dev/null 2>&1 || python=python
+          "$python" .github/scripts/resolve_codex_v8.py '${{ matrix.target }}' >> "$GITHUB_ENV"
 
       - name: Build code mode host
         working-directory: codex-rs
