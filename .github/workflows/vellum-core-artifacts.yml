@@ -36,6 +36,9 @@ jobs:
         with:
           targets: ${{ matrix.target }}
 
+      - name: Ensure target standard library is installed
+        run: rustup target add ${{ matrix.target }}
+
       - name: Cache Rust build
         uses: Swatinem/rust-cache@v2
         with:
