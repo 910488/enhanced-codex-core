@@ -13,7 +13,6 @@ use super::telemetry::EnhancedEvent;
 const PLANE_ENV: &str = "VELLUM_EXECUTION_PLANE";
 const ENHANCED_PLANE: &str = "enhanced-codex";
 const DIGEST_ENV: &str = "VELLUM_RUNTIME_DIGEST";
-const FEATURE_PROFILE_ENV: &str = "VELLUM_ENHANCED_FEATURE_PROFILE";
 const ENHANCED_COMMIT_ENV: &str = "VELLUM_ENHANCED_COMMIT";
 const CHANNEL_CAPACITY: usize = 256;
 
@@ -56,14 +55,9 @@ pub fn identity_from_environment() -> Option<Value> {
 }
 
 fn configured_features() -> EnhancedRuntimeFeatures {
-    std::env::var(FEATURE_PROFILE_ENV)
-        .ok()
-        .and_then(|value| serde_json::from_str(&value).ok())
-        .unwrap_or_else(|| {
-            std::env::var_os("CODEX_HOME")
-                .map(|codex_home| load_features(std::path::Path::new(&codex_home)))
-                .unwrap_or_else(EnhancedRuntimeFeatures::all_off)
-        })
+    std::env::var_os("CODEX_HOME")
+        .map(|codex_home| load_features(std::path::Path::new(&codex_home)))
+        .unwrap_or_else(EnhancedRuntimeFeatures::all_off)
 }
 
 fn profile_label(features: EnhancedRuntimeFeatures) -> &'static str {

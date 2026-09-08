@@ -8,6 +8,7 @@ use super::config::AblationProfile;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum EnhancedEventKind {
+    SessionFeaturesApplied,
     ToolDuplicateDetected,
     ToolDuplicateSuppressed,
     ToolCallIdCollision,
@@ -23,6 +24,7 @@ pub enum EnhancedEventKind {
 impl EnhancedEventKind {
     pub fn name(self) -> &'static str {
         match self {
+            Self::SessionFeaturesApplied => "enhanced.session.features_applied",
             Self::ToolDuplicateDetected => "enhanced.tool.duplicate_detected",
             Self::ToolDuplicateSuppressed => "enhanced.tool.duplicate_suppressed",
             Self::ToolCallIdCollision => "enhanced.tool.call_id_collision",
@@ -113,8 +115,7 @@ fn normalize_field_name(name: &str) -> String {
             && previous.is_some_and(|previous| {
                 previous.is_ascii_lowercase()
                     || previous.is_ascii_digit()
-                    || (previous.is_ascii_uppercase()
-                        && next.is_some_and(char::is_ascii_lowercase))
+                    || (previous.is_ascii_uppercase() && next.is_some_and(char::is_ascii_lowercase))
             });
         if starts_word && !normalized.ends_with('_') {
             normalized.push('_');
@@ -135,7 +136,10 @@ impl MemoryTelemetry {
     }
 
     pub fn count(&self, kind: EnhancedEventKind) -> usize {
-        self.events.iter().filter(|event| event.kind == kind).count()
+        self.events
+            .iter()
+            .filter(|event| event.kind == kind)
+            .count()
     }
 }
 

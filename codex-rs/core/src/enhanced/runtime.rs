@@ -13,9 +13,11 @@ use super::config::EnhancedRuntimeFeatures;
 use super::context_pruner::ModelVisibleSurface;
 use super::hooks::EnhancedTurnHooks;
 use super::telemetry::MemoryTelemetry;
+use super::telemetry::{EnhancedEvent, EnhancedEventFields, EnhancedEventKind};
 
 const CONFIG_FILE: &str = "enhanced-runtime.json";
 const ABLATION_ENV: &str = "VELLUM_ENHANCED_ABLATION_PROFILE";
+const FEATURE_PROFILE_ENV: &str = "VELLUM_ENHANCED_FEATURE_PROFILE";
 
 #[derive(Debug, Default, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -36,9 +38,20 @@ pub struct EnhancedSessionRuntime {
 
 impl EnhancedSessionRuntime {
     pub fn load(codex_home: impl AsRef<Path>) -> Self {
+        let features = load_features(codex_home.as_ref());
+        let applied = EnhancedEvent::new(
+            EnhancedEventKind::SessionFeaturesApplied,
+            EnhancedEventFields {
+                feature_profile: Some(profile_label(features).to_string()),
+                ..EnhancedEventFields::default()
+            },
+        );
+        super::reporting::publish_event(&applied);
         Self {
-            hooks: EnhancedTurnHooks::new(load_features(codex_home.as_ref())),
-            telemetry: MemoryTelemetry::default(),
+            hooks: EnhancedTurnHooks::new(features),
+            telemetry: MemoryTelemetry {
+                events: vec![applied],
+            },
             last_surface: None,
             pending_continuation: None,
             ledger_restored: false,
@@ -62,6 +75,11 @@ pub fn load_features(codex_home: &Path) -> EnhancedRuntimeFeatures {
     {
         return parsed.features();
     }
+    if let Ok(profile) = std::env::var(FEATURE_PROFILE_ENV)
+        && let Some(features) = parse_feature_profile(&profile)
+    {
+        return features;
+    }
     let path = codex_home.join(CONFIG_FILE);
     let Ok(bytes) = std::fs::read(&path) else {
         return EnhancedRuntimeFeatures::all_off();
@@ -81,6 +99,25 @@ pub fn load_features(codex_home: &Path) -> EnhancedRuntimeFeatures {
     }
     file.compiled_feature_defaults
         .unwrap_or_else(EnhancedRuntimeFeatures::all_off)
+}
+
+fn profile_label(features: EnhancedRuntimeFeatures) -> &'static str {
+    [
+        AblationProfile::E0,
+        AblationProfile::E1,
+        AblationProfile::E2,
+        AblationProfile::E3,
+        AblationProfile::E4,
+        AblationProfile::E5,
+    ]
+    .into_iter()
+    .find(|profile| profile.features() == features)
+    .map(AblationProfile::as_str)
+    .unwrap_or("custom")
+}
+
+fn parse_feature_profile(value: &str) -> Option<EnhancedRuntimeFeatures> {
+    serde_json::from_str(value).ok()
 }
 
 #[cfg(test)]
@@ -103,5 +140,16 @@ mod tests {
         assert!(features.qwen_tool_reliability);
         assert!(!features.deepseek_context_recovery);
         assert!(!features.qwen_bounded_continuation);
+    }
+
+    #[test]
+    fn bridge_feature_profile_uses_the_same_shape_as_session_hooks() {
+        let features = parse_feature_profile(
+            r#"{"qwenToolReliability":true,"deepseekContextRecovery":false,"qwenBoundedContinuation":true}"#,
+        )
+        .unwrap();
+        assert!(features.qwen_tool_reliability);
+        assert!(!features.deepseek_context_recovery);
+        assert!(features.qwen_bounded_continuation);
     }
 }

@@ -407,15 +407,35 @@ pub(crate) fn decide_overflow_retry(
 
 fn unfinished_from_items(items: &[ResponseItem]) -> Vec<UnfinishedSignal> {
     let mut unfinished = Vec::new();
+    let mut successful_outputs = std::collections::HashSet::new();
     for item in items.iter().rev() {
+        if let ResponseItem::FunctionCallOutput {
+            call_id: Some(call_id),
+            output,
+            ..
+        } = item
+        {
+            if output.success == Some(true) {
+                successful_outputs.insert(call_id.as_str());
+            }
+            continue;
+        }
         let ResponseItem::FunctionCall {
-            name, arguments, ..
+            name,
+            arguments,
+            call_id,
+            ..
         } = item
         else {
             continue;
         };
         if name != "update_plan" {
             continue;
+        }
+        // Arguments are model output, not trusted control state. Only a plan
+        // accepted by the native PlanHandler may arm automatic continuation.
+        if !successful_outputs.contains(call_id.as_str()) {
+            break;
         }
         if let Ok(args) = serde_json::from_str::<UpdatePlanArgs>(arguments)
             && args
@@ -622,6 +642,55 @@ mod tests {
             output: FunctionCallOutputPayload::from_text("ok".into()),
             internal_chat_message_metadata_passthrough: None,
         }
+    }
+
+    fn plan_call_item(call_id: &str, status: &str) -> ResponseItem {
+        ResponseItem::FunctionCall {
+            id: None,
+            name: "update_plan".into(),
+            namespace: None,
+            arguments: json!({
+                "explanation": null,
+                "plan": [{"step": "finish", "status": status}]
+            })
+            .to_string(),
+            encrypted_function_args: None,
+            call_id: call_id.into(),
+            internal_chat_message_metadata_passthrough: None,
+        }
+    }
+
+    fn plan_output_item(call_id: &str, success: bool) -> ResponseItem {
+        let mut output = FunctionCallOutputPayload::from_text("Plan updated".into());
+        output.success = Some(success);
+        ResponseItem::FunctionCallOutput {
+            id: None,
+            call_id: Some(call_id.into()),
+            name: Some("update_plan".into()),
+            namespace: None,
+            output,
+            internal_chat_message_metadata_passthrough: None,
+        }
+    }
+
+    #[test]
+    fn only_a_successfully_applied_native_plan_can_arm_continuation() {
+        let pending = plan_call_item("plan-1", "pending");
+        assert!(unfinished_from_items(std::slice::from_ref(&pending)).is_empty());
+        assert!(
+            unfinished_from_items(&[pending.clone(), plan_output_item("plan-1", false)]).is_empty()
+        );
+        assert_eq!(
+            unfinished_from_items(&[pending, plan_output_item("plan-1", true)]),
+            vec![UnfinishedSignal::NativePlanIncomplete]
+        );
+        assert!(
+            unfinished_from_items(&[
+                plan_call_item("plan-2", "completed"),
+                plan_output_item("plan-2", true),
+            ])
+            .is_empty()
+        );
     }
 
     #[test]
