@@ -72,6 +72,12 @@ pub fn map_api_error(err: ApiError) -> CodexErr {
             } => {
                 let body_text = body.unwrap_or_default();
 
+                if status == http::StatusCode::BAD_REQUEST
+                    && http_error_code(&body_text).as_deref() == Some("context_length_exceeded")
+                {
+                    return CodexErr::ContextWindowExceeded;
+                }
+
                 if status == http::StatusCode::SERVICE_UNAVAILABLE
                     && let Ok(value) = serde_json::from_str::<serde_json::Value>(&body_text)
                     && matches!(
@@ -194,6 +200,16 @@ pub fn map_api_error(err: ApiError) -> CodexErr {
         },
         ApiError::RateLimit(msg) => CodexErr::Stream(msg),
     }
+}
+
+fn http_error_code(body: &str) -> Option<String> {
+    let parsed = serde_json::from_str::<Value>(body).ok()?;
+    let error = parsed.get("error")?;
+    error
+        .get("code")
+        .and_then(Value::as_str)
+        .or_else(|| error.get("error")?.get("code")?.as_str())
+        .map(str::to_owned)
 }
 
 const ACTIVE_LIMIT_HEADER: &str = "x-codex-active-limit";

@@ -1506,6 +1506,16 @@ async fn run_sampling_request(
                 .for_prompt(&step_context.settings.model_info.input_modalities)
         };
         let mut prompt_input = prompt_input;
+        {
+            let runtime = sess
+                .enhanced
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            crate::enhanced::seams::remove_replayed_tool_calls_from_prompt(
+                &runtime,
+                &mut prompt_input,
+            );
+        }
         if let Some(executed_tool_calls) = sess.services.executed_tool_calls.as_ref()
             && executed_tool_calls
                 .attach_pending_to_prompt(&mut prompt_input, &mut executed_tool_calls_by_output)

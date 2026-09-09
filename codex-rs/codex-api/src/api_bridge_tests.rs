@@ -150,6 +150,25 @@ fn map_api_error_maps_wrapped_websocket_cyber_policy_from_400_body() {
 }
 
 #[test]
+fn map_api_error_maps_context_length_exceeded_from_http_400_body() {
+    for body in [
+        serde_json::json!({"error": {"code": "context_length_exceeded"}}),
+        serde_json::json!({"error": {"error": {"code": "context_length_exceeded"}}}),
+    ] {
+        let err = map_api_error(ApiError::Transport(TransportError::Http {
+            status: http::StatusCode::BAD_REQUEST,
+            url: Some("http://example.com/v1/responses".to_string()),
+            headers: None,
+            body: Some(body.to_string()),
+        }));
+        assert!(matches!(
+            err.details(),
+            CodexErrorDetails::ContextWindowExceeded
+        ));
+    }
+}
+
+#[test]
 fn map_api_error_uses_cyber_policy_fallback_for_missing_message() {
     let body = serde_json::json!({
         "error": {

@@ -354,6 +354,47 @@ pub(crate) fn apply_pressure_to_prompt(
     }
 }
 
+/// Keep exactly one provider call per call id in the model-visible prompt.
+/// The execution seam already suppresses replayed side effects; this closes
+/// the second half of the contract so a duplicate cannot poison the next
+/// provider request with an invalid call/output pairing.
+pub(crate) fn remove_replayed_tool_calls_from_prompt(
+    runtime: &EnhancedSessionRuntime,
+    items: &mut Vec<ResponseItem>,
+) {
+    if !runtime.hooks.features.qwen_tool_reliability {
+        return;
+    }
+    let mut seen = std::collections::HashMap::new();
+    items.retain(|item| match item {
+        ResponseItem::FunctionCall {
+            call_id,
+            name,
+            arguments,
+            ..
+        } => match seen.get(call_id) {
+            Some((seen_name, seen_payload)) => seen_name != name || seen_payload != arguments,
+            None => {
+                seen.insert(call_id.clone(), (name.clone(), arguments.clone()));
+                true
+            }
+        },
+        ResponseItem::CustomToolCall {
+            call_id,
+            name,
+            input,
+            ..
+        } => match seen.get(call_id) {
+            Some((seen_name, seen_payload)) => seen_name != name || seen_payload != input,
+            None => {
+                seen.insert(call_id.clone(), (name.clone(), input.clone()));
+                true
+            }
+        },
+        _ => true,
+    });
+}
+
 pub(crate) fn plan_overflow_for_prompt(
     runtime: &mut EnhancedSessionRuntime,
     sent_items: &[ResponseItem],
@@ -712,6 +753,41 @@ mod tests {
             HookDecision::Handled(AdmitDecision::Execute)
         ));
         assert!(complete_tool_call(&mut runtime, "c1", true).is_ok());
+    }
+
+    #[test]
+    fn replayed_provider_call_is_removed_only_when_e1_is_enabled() {
+        let duplicate = call_item("c1", r#"{"path":"result.txt"}"#);
+        let original = duplicate.clone();
+        let output = output_item("c1");
+
+        let mut disabled_items = vec![original.clone(), duplicate.clone(), output.clone()];
+        remove_replayed_tool_calls_from_prompt(
+            &EnhancedSessionRuntime::all_off(),
+            &mut disabled_items,
+        );
+        assert_eq!(disabled_items.len(), 3);
+
+        let mut runtime = EnhancedSessionRuntime::all_off();
+        runtime.hooks = EnhancedTurnHooks::new(AblationProfile::E1.features());
+        let mut enabled_items = vec![original, duplicate, output.clone()];
+        remove_replayed_tool_calls_from_prompt(&runtime, &mut enabled_items);
+        assert_eq!(
+            enabled_items,
+            vec![call_item("c1", r#"{"path":"result.txt"}"#), output]
+        );
+    }
+
+    #[test]
+    fn colliding_call_id_is_preserved_for_fail_closed_handling() {
+        let mut runtime = EnhancedSessionRuntime::all_off();
+        runtime.hooks = EnhancedTurnHooks::new(AblationProfile::E1.features());
+        let mut items = vec![
+            call_item("c1", r#"{"value":1}"#),
+            call_item("c1", r#"{"value":2}"#),
+        ];
+        remove_replayed_tool_calls_from_prompt(&runtime, &mut items);
+        assert_eq!(items.len(), 2);
     }
 
     #[test]
