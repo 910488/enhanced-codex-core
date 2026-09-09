@@ -31,7 +31,11 @@ use super::context_recovery::CompactDecision;
 use super::context_recovery::OverflowDecision;
 use super::hooks::HookDecision;
 use super::runtime::EnhancedSessionRuntime;
+use super::telemetry::EnhancedEvent;
+use super::telemetry::EnhancedEventFields;
+use super::telemetry::EnhancedEventKind;
 use super::telemetry::MemoryTelemetry;
+use super::telemetry::hash_identifier;
 use super::tool_reliability::AdmitDecision;
 use super::tool_reliability::ProviderToolCallIdentity;
 use super::tool_reliability::ToolCallLedger;
@@ -395,6 +399,59 @@ pub(crate) fn remove_replayed_tool_calls_from_prompt(
     });
 }
 
+/// Suppress exact duplicate calls inside one provider response before Codex
+/// schedules either call. Returning a synthetic failure makes the model retry
+/// the side effect under a fresh call id, so the duplicate is removed at the
+/// stream boundary and only the original reaches the tool runtime.
+pub(crate) fn suppress_replayed_tool_call_in_response(
+    runtime: &mut EnhancedSessionRuntime,
+    item: &ResponseItem,
+    seen: &mut std::collections::HashMap<String, (String, String)>,
+) -> bool {
+    if !runtime.hooks.features.qwen_tool_reliability {
+        return false;
+    }
+    let (call_id, name, payload) = match item {
+        ResponseItem::FunctionCall {
+            call_id,
+            name,
+            arguments,
+            ..
+        } => (call_id, name, arguments),
+        ResponseItem::CustomToolCall {
+            call_id,
+            name,
+            input,
+            ..
+        } => (call_id, name, input),
+        _ => return false,
+    };
+    match seen.get(call_id) {
+        Some((seen_name, seen_payload)) if seen_name == name && seen_payload == payload => {
+            let start = runtime.telemetry.events.len();
+            let fields = EnhancedEventFields {
+                call_id_hash: Some(hash_identifier(call_id)),
+                ..EnhancedEventFields::default()
+            };
+            runtime.telemetry.emit(EnhancedEvent::new(
+                EnhancedEventKind::ToolDuplicateDetected,
+                fields.clone(),
+            ));
+            runtime.telemetry.emit(EnhancedEvent::new(
+                EnhancedEventKind::ToolDuplicateSuppressed,
+                fields,
+            ));
+            log_new_events(&runtime.telemetry, start);
+            true
+        }
+        Some(_) => false,
+        None => {
+            seen.insert(call_id.clone(), (name.clone(), payload.clone()));
+            false
+        }
+    }
+}
+
 pub(crate) fn plan_overflow_for_prompt(
     runtime: &mut EnhancedSessionRuntime,
     sent_items: &[ResponseItem],
@@ -406,7 +463,10 @@ pub(crate) fn plan_overflow_for_prompt(
     match apply_pressure_to_prompt(
         runtime,
         &mut candidate,
-        context_window_tokens,
+        // A provider-confirmed overflow is stronger evidence than the local
+        // estimate. Force the prune trigger while retaining the real window
+        // as the threshold that decides whether native compact is necessary.
+        1,
         context_window_tokens,
     ) {
         PressureSeam::DeferToUpstream => OverflowSeam::DeferToUpstream,
@@ -788,6 +848,52 @@ mod tests {
         ];
         remove_replayed_tool_calls_from_prompt(&runtime, &mut items);
         assert_eq!(items.len(), 2);
+    }
+
+    #[test]
+    fn response_replay_is_suppressed_before_tool_scheduling() {
+        let mut runtime = EnhancedSessionRuntime::all_off();
+        runtime.hooks = EnhancedTurnHooks::new(AblationProfile::E1.features());
+        let call = call_item("c1", r#"{"value":1}"#);
+        let mut seen = std::collections::HashMap::new();
+        assert!(!suppress_replayed_tool_call_in_response(
+            &mut runtime,
+            &call,
+            &mut seen
+        ));
+        assert!(suppress_replayed_tool_call_in_response(
+            &mut runtime,
+            &call,
+            &mut seen
+        ));
+        assert_eq!(
+            runtime
+                .telemetry
+                .count(EnhancedEventKind::ToolDuplicateSuppressed),
+            1
+        );
+        assert!(runtime.hooks.ledger.is_empty());
+    }
+
+    #[test]
+    fn provider_overflow_forces_prune_below_local_pressure_threshold() {
+        let mut runtime = EnhancedSessionRuntime::all_off();
+        runtime.hooks = EnhancedTurnHooks::new(AblationProfile::E2.features());
+        let call = call_item("c1", "{}");
+        let mut output = output_item("c1");
+        if let ResponseItem::FunctionCallOutput { output, .. } = &mut output {
+            *output = FunctionCallOutputPayload::from_text("x".repeat(8_000));
+        }
+        assert!(matches!(
+            plan_overflow_for_prompt(&mut runtime, &[call, output], 24_000, false),
+            OverflowSeam::Retry { .. }
+        ));
+        assert_eq!(
+            runtime
+                .telemetry
+                .count(EnhancedEventKind::ContextOverflowRetry),
+            1
+        );
     }
 
     #[test]

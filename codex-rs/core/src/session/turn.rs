@@ -2500,6 +2500,7 @@ async fn try_run_sampling_request(
     let mut should_emit_token_count = false;
     const MAX_ANALYTICS_TOOL_CALL_IDS_PER_RESPONSE: usize = 256;
     let mut analytics_tool_call_ids = Vec::new();
+    let mut enhanced_response_tool_calls = HashMap::new();
     let reasoning_effort = step_context
         .settings
         .reasoning_effort()
@@ -2617,6 +2618,21 @@ async fn try_run_sampling_request(
                     )
                     .await
                 {
+                    continue;
+                }
+
+                let suppress_replay = {
+                    let mut runtime = sess
+                        .enhanced
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner);
+                    crate::enhanced::seams::suppress_replayed_tool_call_in_response(
+                        &mut runtime,
+                        &item,
+                        &mut enhanced_response_tool_calls,
+                    )
+                };
+                if suppress_replay {
                     continue;
                 }
 
