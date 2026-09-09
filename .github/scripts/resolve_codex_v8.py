@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import os
 import sys
+from collections.abc import Mapping
 from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
@@ -27,6 +28,17 @@ sys.path.insert(0, str(REPO_ROOT / "scripts"))
 
 from codex_package.targets import TARGET_SPECS  # noqa: E402
 from codex_package.v8 import fetch_codex_v8_artifacts  # noqa: E402
+
+
+def workflow_cache_root(environ: Mapping[str, str]) -> Path | None:
+    """Use a per-attempt path so restored Cargo fingerprints cannot skip V8 setup."""
+
+    runner_temp = environ.get("RUNNER_TEMP")
+    run_id = environ.get("GITHUB_RUN_ID")
+    run_attempt = environ.get("GITHUB_RUN_ATTEMPT")
+    if not (runner_temp and run_id and run_attempt):
+        return None
+    return Path(runner_temp) / f"codex-v8-{run_id}-{run_attempt}"
 
 
 def main(argv: list[str]) -> int:
@@ -41,7 +53,10 @@ def main(argv: list[str]) -> int:
         print(f"unsupported target {target}; expected one of {supported}", file=sys.stderr)
         return 2
 
-    artifacts = fetch_codex_v8_artifacts(spec)
+    artifacts = fetch_codex_v8_artifacts(
+        spec,
+        cache_root=workflow_cache_root(os.environ),
+    )
     print(f"RUSTY_V8_ARCHIVE={artifacts.archive}")
     print(f"RUSTY_V8_SRC_BINDING_PATH={artifacts.binding}")
     return 0

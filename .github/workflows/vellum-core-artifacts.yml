@@ -69,6 +69,14 @@ jobs:
           command -v python3 >/dev/null 2>&1 || python=python
           "$python" .github/scripts/resolve_codex_v8.py '${{ matrix.target }}' >> "$GITHUB_ENV"
 
+      # rust-cache can restore Cargo's V8 build-script fingerprint without the
+      # large native archive placed outside Cargo's package output directory.
+      # Cleaning only this dependency guarantees that its build script copies
+      # the verified Codex archive into the linker search directory.
+      - name: Reset cached V8 build state
+        working-directory: codex-rs
+        run: cargo clean --release --target ${{ matrix.target }} -p v8
+
       - name: Build code mode host
         working-directory: codex-rs
         run: cargo build --release --locked --target ${{ matrix.target }} -p codex-code-mode-host
