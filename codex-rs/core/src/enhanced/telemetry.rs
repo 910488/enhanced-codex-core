@@ -1,5 +1,7 @@
-use serde::{Deserialize, Serialize};
-use sha2::{Digest, Sha256};
+use serde::Deserialize;
+use serde::Serialize;
+use sha2::Digest;
+use sha2::Sha256;
 
 use super::config::AblationProfile;
 
@@ -9,6 +11,8 @@ use super::config::AblationProfile;
 #[serde(rename_all = "snake_case")]
 pub enum EnhancedEventKind {
     SessionFeaturesApplied,
+    ToolCallAdmitted,
+    ToolCallCompleted,
     ToolDuplicateDetected,
     ToolDuplicateSuppressed,
     ToolCallIdCollision,
@@ -20,6 +24,8 @@ pub enum EnhancedEventKind {
     ContextProjectionApplied,
     ContextProjectionRestored,
     ContextProjectionCleared,
+    ContextPressureChecked,
+    ContinuationEvaluated,
     ContinuationAllowed,
     ContinuationExhausted,
 }
@@ -28,6 +34,8 @@ impl EnhancedEventKind {
     pub fn name(self) -> &'static str {
         match self {
             Self::SessionFeaturesApplied => "enhanced.session.features_applied",
+            Self::ToolCallAdmitted => "enhanced.tool.call_admitted",
+            Self::ToolCallCompleted => "enhanced.tool.call_completed",
             Self::ToolDuplicateDetected => "enhanced.tool.duplicate_detected",
             Self::ToolDuplicateSuppressed => "enhanced.tool.duplicate_suppressed",
             Self::ToolCallIdCollision => "enhanced.tool.call_id_collision",
@@ -39,6 +47,8 @@ impl EnhancedEventKind {
             Self::ContextProjectionApplied => "enhanced.context.projection_applied",
             Self::ContextProjectionRestored => "enhanced.context.projection_restored",
             Self::ContextProjectionCleared => "enhanced.context.projection_cleared",
+            Self::ContextPressureChecked => "enhanced.context.pressure_checked",
+            Self::ContinuationEvaluated => "enhanced.continuation.evaluated",
             Self::ContinuationAllowed => "enhanced.continuation.allowed",
             Self::ContinuationExhausted => "enhanced.continuation.exhausted",
         }
@@ -60,6 +70,9 @@ pub struct EnhancedEventFields {
     pub chars_removed: Option<u64>,
     pub retry_index: Option<u8>,
     pub continuation_index: Option<u8>,
+    pub unfinished_signal_count: Option<u64>,
+    pub outcome: Option<String>,
+    pub succeeded: Option<bool>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -134,10 +147,21 @@ fn normalize_field_name(name: &str) -> String {
 #[derive(Debug, Default)]
 pub struct MemoryTelemetry {
     pub events: Vec<EnhancedEvent>,
+    thread_id_hash: Option<String>,
 }
 
 impl MemoryTelemetry {
-    pub fn emit(&mut self, event: EnhancedEvent) {
+    pub fn for_thread(thread_id: &str) -> Self {
+        Self {
+            events: Vec::new(),
+            thread_id_hash: Some(hash_identifier(thread_id)),
+        }
+    }
+
+    pub fn emit(&mut self, mut event: EnhancedEvent) {
+        if event.fields.thread_id_hash.is_none() {
+            event.fields.thread_id_hash.clone_from(&self.thread_id_hash);
+        }
         self.events.push(event);
     }
 

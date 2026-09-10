@@ -14,6 +14,7 @@ pub mod config;
 pub mod context_projection;
 pub mod context_pruner;
 pub mod context_recovery;
+mod debug_log;
 pub mod digest;
 pub mod gateway;
 pub mod hooks;

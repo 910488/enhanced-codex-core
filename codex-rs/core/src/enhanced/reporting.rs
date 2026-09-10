@@ -39,13 +39,14 @@ pub fn subscribe() -> Option<broadcast::Receiver<Value>> {
 
 pub fn publish_event(event: &EnhancedEvent) {
     if is_enhanced_process() {
-        if IDENTITY_LOGGED.set(()).is_ok() {
-            if let Some(identity) = identity_from_environment() {
+        if IDENTITY_LOGGED.set(()).is_ok()
+            && let Some(identity) = identity_from_environment() {
                 append_jsonl(&identity);
+                super::debug_log::publish(identity);
             }
-        }
         let notification = event_notification(event);
         append_jsonl(&notification);
+        super::debug_log::publish(notification.clone());
         let _ = reports().send(notification);
     }
 }

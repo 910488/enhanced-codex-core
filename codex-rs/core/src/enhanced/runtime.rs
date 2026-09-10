@@ -13,8 +13,10 @@ use super::config::EnhancedRuntimeFeatures;
 use super::context_projection::ContextProjectionStore;
 use super::context_pruner::ModelVisibleSurface;
 use super::hooks::EnhancedTurnHooks;
+use super::telemetry::EnhancedEvent;
+use super::telemetry::EnhancedEventFields;
+use super::telemetry::EnhancedEventKind;
 use super::telemetry::MemoryTelemetry;
-use super::telemetry::{EnhancedEvent, EnhancedEventFields, EnhancedEventKind};
 
 const CONFIG_FILE: &str = "enhanced-runtime.json";
 const ABLATION_ENV: &str = "VELLUM_ENHANCED_ABLATION_PROFILE";
@@ -41,6 +43,7 @@ pub struct EnhancedSessionRuntime {
 impl EnhancedSessionRuntime {
     pub fn load(codex_home: impl AsRef<Path>, thread_id: &str) -> Self {
         let features = load_features(codex_home.as_ref());
+        let mut telemetry = MemoryTelemetry::for_thread(thread_id);
         let applied = EnhancedEvent::new(
             EnhancedEventKind::SessionFeaturesApplied,
             EnhancedEventFields {
@@ -48,12 +51,11 @@ impl EnhancedSessionRuntime {
                 ..EnhancedEventFields::default()
             },
         );
-        super::reporting::publish_event(&applied);
+        telemetry.emit(applied);
+        super::reporting::publish_event(&telemetry.events[0]);
         Self {
             hooks: EnhancedTurnHooks::new(features),
-            telemetry: MemoryTelemetry {
-                events: vec![applied],
-            },
+            telemetry,
             last_surface: None,
             pending_continuation: None,
             ledger_restored: false,

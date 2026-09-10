@@ -1,6 +1,9 @@
-use serde::{Deserialize, Serialize};
+use serde::Deserialize;
+use serde::Serialize;
 
-use super::telemetry::{EnhancedEvent, EnhancedEventFields, EnhancedEventKind};
+use super::telemetry::EnhancedEvent;
+use super::telemetry::EnhancedEventFields;
+use super::telemetry::EnhancedEventKind;
 
 /// Shared experimental prune profile. V1 does not branch on model name.
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
@@ -188,11 +191,10 @@ pub fn apply_pressure_prune(
     // dropped and the item is measured directly from what is left.
     let mut rewritten_items = Vec::new();
     for (index, item) in next.items.iter_mut().enumerate() {
-        if let SurfaceItem::ToolResult { blocks, .. } = item {
-            if prune_blocks(blocks, policy) > 0 {
+        if let SurfaceItem::ToolResult { blocks, .. } = item
+            && prune_blocks(blocks, policy) > 0 {
                 rewritten_items.push(index);
             }
-        }
     }
     for index in rewritten_items {
         if let Some(slot) = next.item_token_estimates.get_mut(index) {
@@ -200,7 +202,9 @@ pub fn apply_pressure_prune(
         }
     }
     let bytes_removed = surface.byte_count().saturating_sub(next.byte_count()) as u64;
-    next.generation = surface.generation.saturating_add(if bytes_removed > 0 { 1 } else { 0 });
+    next.generation = surface
+        .generation
+        .saturating_add(if bytes_removed > 0 { 1 } else { 0 });
     let after = next.estimated_tokens();
     events.push(EnhancedEvent::new(
         EnhancedEventKind::ContextPruneCompleted,
@@ -235,16 +239,20 @@ fn prune_blocks(blocks: &mut [ContentBlock], policy: ToolResultPrunePolicy) -> u
     if total_bytes < policy.min_text_bytes {
         return 0;
     }
-    let keep = policy.keep_head_bytes.saturating_add(policy.keep_tail_bytes);
+    let keep = policy
+        .keep_head_bytes
+        .saturating_add(policy.keep_tail_bytes);
     if total_bytes <= keep {
         return 0;
     }
     let head_end = policy.keep_head_bytes;
     let tail_start = total_bytes.saturating_sub(policy.keep_tail_bytes);
     let omitted = tail_start.saturating_sub(head_end);
-    let marker = format!("
+    let marker = format!(
+        "
 [... omitted {omitted} bytes ...]
-");
+"
+    );
     let mut cursor = 0usize;
     let mut marker_inserted = false;
     let mut kept_bytes = 0usize;
@@ -330,7 +338,7 @@ mod tests {
 
         let guessed = ModelVisibleSurface {
             item_token_estimates: Vec::new(),
-            ..surface.clone()
+            ..surface
         };
         assert!(
             guessed.estimated_tokens() < 1_700,
@@ -394,7 +402,6 @@ mod tests {
         assert_eq!(outcome.surface.item_token_estimates, vec![Some(7), None]);
     }
 
-
     /// Codex estimates tokens as UTF-8 bytes over `APPROX_BYTES_PER_TOKEN = 4`
     /// (`codex-rs/utils/string/src/truncate.rs`). This crate has to agree, or
     /// the two of them make different decisions about the same history.
@@ -432,7 +439,7 @@ mod tests {
         let text = "犢皮紙".repeat(400); // 3 chars * 3 bytes * 400 = 3600 bytes
         let mut blocks = vec![ContentBlock {
             kind: "text".into(),
-            text: Some(text.clone()),
+            text: Some(text),
         }];
         let removed = prune_blocks(&mut blocks, ToolResultPrunePolicy::default());
         assert!(removed > 0, "3600 bytes is past the 2000-byte trigger");
@@ -447,7 +454,6 @@ mod tests {
         );
         assert!(kept.starts_with('犢'), "the head is kept whole");
     }
-
 
     fn huge_result(chars: usize) -> ModelVisibleSurface {
         ModelVisibleSurface {

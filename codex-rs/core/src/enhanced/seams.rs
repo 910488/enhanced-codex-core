@@ -169,6 +169,17 @@ pub(crate) fn complete_tool_call(
                 ToolCallResolution::Failed
             },
         );
+        let start = runtime.telemetry.events.len();
+        runtime.telemetry.emit(EnhancedEvent::new(
+            EnhancedEventKind::ToolCallCompleted,
+            EnhancedEventFields {
+                call_id_hash: Some(hash_identifier(call_id)),
+                outcome: Some(if succeeded { "executed" } else { "failed" }.into()),
+                succeeded: Some(succeeded),
+                ..EnhancedEventFields::default()
+            },
+        ));
+        log_new_events(&runtime.telemetry, start);
     }
     Ok(())
 }

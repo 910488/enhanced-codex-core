@@ -1,6 +1,9 @@
-use serde::{Deserialize, Serialize};
+use serde::Deserialize;
+use serde::Serialize;
 
-use super::telemetry::{EnhancedEvent, EnhancedEventFields, EnhancedEventKind};
+use super::telemetry::EnhancedEvent;
+use super::telemetry::EnhancedEventFields;
+use super::telemetry::EnhancedEventKind;
 
 pub const MAX_AUTO_CONTINUATIONS: u8 = 2;
 
@@ -98,13 +101,12 @@ pub fn plan_turn_stop(
             events: Vec::new(),
         };
     }
-    let unfinished = context
+    let has_unfinished = context
         .unfinished
         .iter()
         .copied()
-        .filter(|signal| *signal != UnfinishedSignal::NativeSubagentWorkRemaining)
-        .collect::<Vec<_>>();
-    if unfinished.is_empty() {
+        .any(|signal| signal != UnfinishedSignal::NativeSubagentWorkRemaining);
+    if !has_unfinished {
         return ContinuationPlan {
             decision: ContinuationDecision::AllowStop,
             reservation: None,
@@ -173,7 +175,10 @@ mod tests {
         }
     }
 
-    fn commit_plan(budget: &mut AutoContinuationBudget, context: &TurnStopContext) -> ContinuationDecision {
+    fn commit_plan(
+        budget: &mut AutoContinuationBudget,
+        context: &TurnStopContext,
+    ) -> ContinuationDecision {
         let plan = plan_turn_stop(budget, context);
         if let Some(reserved) = plan.reservation {
             commit_continuation(budget, reserved).unwrap();

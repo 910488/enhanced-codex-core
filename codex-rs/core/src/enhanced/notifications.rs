@@ -10,11 +10,14 @@
 //! invent a field the bridge will refuse — and so the contract can be tested
 //! without a fork build.
 
-use serde::{Deserialize, Serialize};
-use serde_json::{Map, Value};
+use serde::Deserialize;
+use serde::Serialize;
+use serde_json::Map;
+use serde_json::Value;
 
 use super::config::EnhancedRuntimeFeatures;
-use super::telemetry::{field_name_is_forbidden, EnhancedEvent};
+use super::telemetry::EnhancedEvent;
+use super::telemetry::field_name_is_forbidden;
 
 pub const ENHANCED_IDENTITY_NOTIFICATION: &str = "vellum/enhancedRuntimeIdentity";
 pub const ENHANCED_EVENT_NOTIFICATION: &str = "vellum/enhancedEvent";
@@ -90,9 +93,10 @@ pub fn event_notification(event: &EnhancedEvent) -> Value {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use super::super::config::AblationProfile;
-    use super::super::telemetry::{EnhancedEventFields, EnhancedEventKind};
+    use super::super::telemetry::EnhancedEventFields;
+    use super::super::telemetry::EnhancedEventKind;
+    use super::*;
 
     #[test]
     fn identity_reports_every_port_flag_explicitly() {

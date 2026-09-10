@@ -1,19 +1,32 @@
 use serde_json::Value;
 
-use super::bounded_continuation::{
-    commit_continuation, plan_turn_stop, release_continuation, AutoContinuationBudget,
-    ContinuationPlan, ReservedContinuation, TurnStopContext,
-};
+use super::bounded_continuation::AutoContinuationBudget;
+use super::bounded_continuation::ContinuationDecision;
+use super::bounded_continuation::ContinuationPlan;
+use super::bounded_continuation::ReservedContinuation;
+use super::bounded_continuation::TurnStopContext;
+use super::bounded_continuation::commit_continuation;
+use super::bounded_continuation::plan_turn_stop;
+use super::bounded_continuation::release_continuation;
 use super::config::EnhancedRuntimeFeatures;
-use super::context_pruner::{ModelVisibleSurface, ToolResultPrunePolicy};
-use super::context_recovery::{
-    plan_context_pressure, plan_overflow_retry, OverflowAttempt, OverflowPlan, PressurePlan,
-};
+use super::context_pruner::ModelVisibleSurface;
+use super::context_pruner::ToolResultPrunePolicy;
+use super::context_recovery::OverflowAttempt;
+use super::context_recovery::OverflowPlan;
+use super::context_recovery::PressurePlan;
+use super::context_recovery::plan_context_pressure;
+use super::context_recovery::plan_overflow_retry;
+use super::telemetry::EnhancedEvent;
+use super::telemetry::EnhancedEventFields;
+use super::telemetry::EnhancedEventKind;
 use super::telemetry::MemoryTelemetry;
-use super::tool_reliability::{
-    AdmitDecision, LateResultDecision, ProviderToolCallIdentity, ToolCallLedger,
-    ToolCallResolution, ToolReliabilityOutcome,
-};
+use super::telemetry::hash_identifier;
+use super::tool_reliability::AdmitDecision;
+use super::tool_reliability::LateResultDecision;
+use super::tool_reliability::ProviderToolCallIdentity;
+use super::tool_reliability::ToolCallLedger;
+use super::tool_reliability::ToolCallResolution;
+use super::tool_reliability::ToolReliabilityOutcome;
 
 /// When a feature is off the hook must not invent a Codex decision. The
 /// caller falls through to unmodified upstream behavior.
@@ -67,9 +80,20 @@ impl EnhancedTurnHooks {
         if !self.features.qwen_tool_reliability {
             return HookDecision::DeferToUpstream;
         }
+        let call_id_hash = hash_identifier(&identity.provider_call_id);
         let ToolReliabilityOutcome { decision, events } = self.ledger.admit(identity);
         for event in events {
             telemetry.emit(event);
+        }
+        if matches!(decision, AdmitDecision::Execute) {
+            telemetry.emit(EnhancedEvent::new(
+                EnhancedEventKind::ToolCallAdmitted,
+                EnhancedEventFields {
+                    call_id_hash: Some(call_id_hash),
+                    outcome: Some("execute".into()),
+                    ..EnhancedEventFields::default()
+                },
+            ));
         }
         HookDecision::Handled(decision)
     }
@@ -116,6 +140,26 @@ impl EnhancedTurnHooks {
             context_window_tokens,
             compact_threshold_tokens,
         );
+        telemetry.emit(EnhancedEvent::new(
+            EnhancedEventKind::ContextPressureChecked,
+            EnhancedEventFields {
+                before_token_estimate: Some(plan.prune.before_token_estimate),
+                after_token_estimate: Some(plan.prune.after_token_estimate),
+                chars_removed: Some(plan.prune.bytes_removed),
+                outcome: Some(
+                    match (plan.prune.rewritten, plan.compact) {
+                        (
+                            _,
+                            super::context_recovery::CompactDecision::RunNativeCodexLocalCompact,
+                        ) => "native_compact",
+                        (true, super::context_recovery::CompactDecision::Skip) => "pruned",
+                        (false, super::context_recovery::CompactDecision::Skip) => "unchanged",
+                    }
+                    .into(),
+                ),
+                ..EnhancedEventFields::default()
+            },
+        ));
         for event in &plan.events {
             telemetry.emit(event.clone());
         }
@@ -162,6 +206,23 @@ impl EnhancedTurnHooks {
             self.overflow_retries_used = 0;
         }
         let plan = plan_turn_stop(&mut self.continuation, context);
+        telemetry.emit(EnhancedEvent::new(
+            EnhancedEventKind::ContinuationEvaluated,
+            EnhancedEventFields {
+                unfinished_signal_count: Some(context.unfinished.len() as u64),
+                outcome: Some(
+                    match plan.decision {
+                        ContinuationDecision::AllowStop => "allow_stop",
+                        ContinuationDecision::Continue { .. } => "continue",
+                        ContinuationDecision::StopCancelled => "cancelled",
+                        ContinuationDecision::StopUserSteer => "user_steer",
+                        ContinuationDecision::StopBudgetExhausted => "budget_exhausted",
+                    }
+                    .into(),
+                ),
+                ..EnhancedEventFields::default()
+            },
+        ));
         for event in &plan.events {
             telemetry.emit(event.clone());
         }
@@ -179,7 +240,10 @@ impl EnhancedTurnHooks {
         release_continuation(&mut self.continuation);
     }
 
-    pub fn restore_ledger(&mut self, value: &Value) -> Result<(), super::tool_reliability::LedgerError> {
+    pub fn restore_ledger(
+        &mut self,
+        value: &Value,
+    ) -> Result<(), super::tool_reliability::LedgerError> {
         self.ledger = ToolCallLedger::from_durable_json(value)?;
         Ok(())
     }
@@ -187,10 +251,11 @@ impl EnhancedTurnHooks {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use super::super::config::AblationProfile;
-    use super::super::context_recovery::{OverflowDecision, OverflowPlan};
+    use super::super::context_recovery::OverflowDecision;
+    use super::super::context_recovery::OverflowPlan;
     use super::super::tool_reliability::ToolCallLedger;
+    use super::*;
     use serde_json::json;
 
     #[test]
