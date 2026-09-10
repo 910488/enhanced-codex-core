@@ -6630,6 +6630,7 @@ pub(crate) async fn make_session_and_context() -> (Session, TurnContext) {
         next_internal_sub_id: AtomicU64::new(0),
         enhanced: std::sync::Mutex::new(crate::enhanced::runtime::EnhancedSessionRuntime::load(
             session_configuration.codex_home.as_path(),
+            "test-thread",
         )),
     };
     let per_turn_config =
@@ -8933,6 +8934,7 @@ where
         next_internal_sub_id: AtomicU64::new(0),
         enhanced: std::sync::Mutex::new(crate::enhanced::runtime::EnhancedSessionRuntime::load(
             session_configuration.codex_home.as_path(),
+            "test-thread",
         )),
     });
     let per_turn_config =

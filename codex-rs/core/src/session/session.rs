@@ -1519,6 +1519,7 @@ impl Session {
                 enhanced: std::sync::Mutex::new(
                     crate::enhanced::runtime::EnhancedSessionRuntime::load(
                         session_configuration.codex_home.as_path(),
+                        &thread_id.to_string(),
                     ),
                 ),
             });

@@ -321,6 +321,125 @@ fn apply_surface_to_items(items: &mut [ResponseItem], surface: &ModelVisibleSurf
     }
 }
 
+fn output_identity_and_text(item: &ResponseItem) -> Option<(&str, String)> {
+    match item {
+        ResponseItem::FunctionCallOutput {
+            call_id: Some(call_id),
+            output,
+            ..
+        }
+        | ResponseItem::CustomToolCallOutput {
+            call_id, output, ..
+        } => output.body.to_text().map(|text| (call_id.as_str(), text)),
+        _ => None,
+    }
+}
+
+fn replace_output_text(item: &mut ResponseItem, text: String) {
+    match item {
+        ResponseItem::FunctionCallOutput { output, .. }
+        | ResponseItem::CustomToolCallOutput { output, .. } => {
+            output.body = FunctionCallOutputBody::Text(text);
+        }
+        _ => {}
+    }
+}
+
+fn remember_context_projections(
+    runtime: &mut EnhancedSessionRuntime,
+    original: &[ResponseItem],
+    projected: &[ResponseItem],
+) {
+    if !runtime.hooks.features.deepseek_context_recovery {
+        return;
+    }
+    let projected_by_call = projected
+        .iter()
+        .filter_map(output_identity_and_text)
+        .collect::<std::collections::HashMap<_, _>>();
+    for item in original {
+        let Some((call_id, original_text)) = output_identity_and_text(item) else {
+            continue;
+        };
+        let Some(projected_text) = projected_by_call.get(call_id) else {
+            continue;
+        };
+        runtime
+            .context_projections
+            .record(call_id, &original_text, projected_text);
+    }
+}
+
+pub(crate) fn apply_context_projections(
+    runtime: &mut EnhancedSessionRuntime,
+    items: &mut [ResponseItem],
+) {
+    if !runtime.hooks.features.deepseek_context_recovery {
+        return;
+    }
+    let before_token_estimate = response_items_to_surface(items).estimated_tokens();
+    let mut applied = 0_u64;
+    let mut chars_removed = 0_u64;
+    let mut first_call_id = None;
+    for item in items.iter_mut() {
+        let Some((call_id, original_text)) = output_identity_and_text(item) else {
+            continue;
+        };
+        let replacement = runtime
+            .context_projections
+            .replacement(call_id, &original_text)
+            .map(str::to_string);
+        let Some(replacement) = replacement else {
+            continue;
+        };
+        applied = applied.saturating_add(1);
+        chars_removed = chars_removed
+            .saturating_add(original_text.len().saturating_sub(replacement.len()) as u64);
+        first_call_id.get_or_insert_with(|| call_id.to_string());
+        replace_output_text(item, replacement);
+    }
+    let stats = runtime
+        .context_projections
+        .note_application(applied, chars_removed);
+    if stats.applied == 0 {
+        return;
+    }
+    let start = runtime.telemetry.events.len();
+    let after_token_estimate = response_items_to_surface(items).estimated_tokens();
+    let fields = EnhancedEventFields {
+        call_id_hash: first_call_id.as_deref().map(hash_identifier),
+        before_token_estimate: Some(before_token_estimate),
+        after_token_estimate: Some(after_token_estimate),
+        chars_removed: Some(stats.chars_removed),
+        ..EnhancedEventFields::default()
+    };
+    runtime.telemetry.emit(EnhancedEvent::new(
+        EnhancedEventKind::ContextProjectionApplied,
+        fields.clone(),
+    ));
+    if stats.restored {
+        runtime.telemetry.emit(EnhancedEvent::new(
+            EnhancedEventKind::ContextProjectionRestored,
+            fields,
+        ));
+    }
+    log_new_events(&runtime.telemetry, start);
+}
+
+pub(crate) fn clear_context_projections_after_compaction(runtime: &mut EnhancedSessionRuntime) {
+    if !runtime.hooks.features.deepseek_context_recovery
+        || !runtime.context_projections.clear_after_compaction()
+    {
+        return;
+    }
+    let start = runtime.telemetry.events.len();
+    runtime.telemetry.emit(EnhancedEvent::new(
+        EnhancedEventKind::ContextProjectionCleared,
+        EnhancedEventFields::default(),
+    ));
+    log_new_events(&runtime.telemetry, start);
+}
+
 pub(crate) fn apply_pressure_to_prompt(
     runtime: &mut EnhancedSessionRuntime,
     items: &mut [ResponseItem],
@@ -330,6 +449,7 @@ pub(crate) fn apply_pressure_to_prompt(
     if context_window_tokens == 0 {
         return PressureSeam::DeferToUpstream;
     }
+    let original = items.to_vec();
     let surface = response_items_to_surface(items);
     let decision = {
         let (hooks, telemetry) = split_runtime(runtime);
@@ -348,6 +468,7 @@ pub(crate) fn apply_pressure_to_prompt(
         HookDecision::Handled(plan) => {
             if plan.prune.rewritten {
                 apply_surface_to_items(items, &plan.prune.surface);
+                remember_context_projections(runtime, &original, items);
             }
             runtime.last_surface = Some(plan.prune.surface);
             match plan.compact {
@@ -893,6 +1014,84 @@ mod tests {
                 .telemetry
                 .count(EnhancedEventKind::ContextOverflowRetry),
             1
+        );
+    }
+
+    #[test]
+    fn context_projection_persists_across_follow_up_prompts_without_losing_new_input() {
+        let mut runtime = EnhancedSessionRuntime::all_off();
+        runtime.hooks = EnhancedTurnHooks::new(AblationProfile::E2.features());
+        let mut original_output = output_item("c1");
+        if let ResponseItem::FunctionCallOutput { output, .. } = &mut original_output {
+            *output = FunctionCallOutputPayload::from_text("x".repeat(8_000));
+        }
+        let original = vec![call_item("c1", "{}"), original_output];
+        let OverflowSeam::Retry { pruned } =
+            plan_overflow_for_prompt(&mut runtime, &original, 24_000, false)
+        else {
+            panic!("overflow must produce one pruned retry");
+        };
+        assert!(
+            response_items_to_surface(&pruned).byte_count()
+                < response_items_to_surface(&original).byte_count()
+        );
+
+        for follow_up in 0..3 {
+            let mut prompt = original.clone();
+            prompt.push(ResponseItem::Message {
+                id: None,
+                role: "user".into(),
+                content: vec![ContentItem::InputText {
+                    text: format!("follow-up-{follow_up}"),
+                }],
+                phase: None,
+                internal_chat_message_metadata_passthrough: None,
+            });
+            apply_context_projections(&mut runtime, &mut prompt);
+            assert!(
+                response_items_to_surface(&prompt).byte_count()
+                    < response_items_to_surface(&original).byte_count() + 100
+            );
+            assert!(matches!(
+                prompt.last(),
+                Some(ResponseItem::Message { content, .. })
+                    if content_text(content) == format!("follow-up-{follow_up}")
+            ));
+        }
+        assert_eq!(
+            runtime
+                .telemetry
+                .count(EnhancedEventKind::ContextProjectionApplied),
+            3
+        );
+    }
+
+    #[test]
+    fn context_projection_does_not_match_changed_output_and_clears_after_compaction() {
+        let mut runtime = EnhancedSessionRuntime::all_off();
+        runtime.hooks = EnhancedTurnHooks::new(AblationProfile::E2.features());
+        runtime
+            .context_projections
+            .record("c1", "large original", "small");
+        let mut changed = output_item("c1");
+        if let ResponseItem::FunctionCallOutput { output, .. } = &mut changed {
+            *output = FunctionCallOutputPayload::from_text("different original".into());
+        }
+        apply_context_projections(&mut runtime, std::slice::from_mut(&mut changed));
+        assert_eq!(
+            output_identity_and_text(&changed).unwrap().1,
+            "different original"
+        );
+
+        clear_context_projections_after_compaction(&mut runtime);
+        let mut original = output_item("c1");
+        if let ResponseItem::FunctionCallOutput { output, .. } = &mut original {
+            *output = FunctionCallOutputPayload::from_text("large original".into());
+        }
+        apply_context_projections(&mut runtime, std::slice::from_mut(&mut original));
+        assert_eq!(
+            output_identity_and_text(&original).unwrap().1,
+            "large original"
         );
     }
 

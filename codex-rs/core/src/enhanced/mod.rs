@@ -11,6 +11,7 @@
 
 pub mod bounded_continuation;
 pub mod config;
+pub mod context_projection;
 pub mod context_pruner;
 pub mod context_recovery;
 pub mod digest;
@@ -35,6 +36,9 @@ pub use bounded_continuation::plan_turn_stop;
 pub use bounded_continuation::release_continuation;
 pub use config::AblationProfile;
 pub use config::EnhancedRuntimeFeatures;
+pub use context_projection::ContextProjectionRecord;
+pub use context_projection::ContextProjectionStore;
+pub use context_projection::ProjectionApplyStats;
 pub use context_pruner::ContentBlock;
 pub use context_pruner::ModelVisibleSurface;
 pub use context_pruner::PruneOutcome;

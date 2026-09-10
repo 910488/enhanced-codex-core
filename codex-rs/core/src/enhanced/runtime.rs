@@ -10,6 +10,7 @@ use serde::Deserialize;
 use super::bounded_continuation::ReservedContinuation;
 use super::config::AblationProfile;
 use super::config::EnhancedRuntimeFeatures;
+use super::context_projection::ContextProjectionStore;
 use super::context_pruner::ModelVisibleSurface;
 use super::hooks::EnhancedTurnHooks;
 use super::telemetry::MemoryTelemetry;
@@ -34,10 +35,11 @@ pub struct EnhancedSessionRuntime {
     pub last_surface: Option<ModelVisibleSurface>,
     pub pending_continuation: Option<ReservedContinuation>,
     pub ledger_restored: bool,
+    pub context_projections: ContextProjectionStore,
 }
 
 impl EnhancedSessionRuntime {
-    pub fn load(codex_home: impl AsRef<Path>) -> Self {
+    pub fn load(codex_home: impl AsRef<Path>, thread_id: &str) -> Self {
         let features = load_features(codex_home.as_ref());
         let applied = EnhancedEvent::new(
             EnhancedEventKind::SessionFeaturesApplied,
@@ -55,6 +57,7 @@ impl EnhancedSessionRuntime {
             last_surface: None,
             pending_continuation: None,
             ledger_restored: false,
+            context_projections: ContextProjectionStore::load(codex_home.as_ref(), thread_id),
         }
     }
 
@@ -65,6 +68,7 @@ impl EnhancedSessionRuntime {
             last_surface: None,
             pending_continuation: None,
             ledger_restored: false,
+            context_projections: ContextProjectionStore::in_memory(),
         }
     }
 }

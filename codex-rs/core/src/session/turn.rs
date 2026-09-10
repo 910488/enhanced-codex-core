@@ -1507,10 +1507,11 @@ async fn run_sampling_request(
         };
         let mut prompt_input = prompt_input;
         {
-            let runtime = sess
+            let mut runtime = sess
                 .enhanced
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
+            crate::enhanced::seams::apply_context_projections(&mut runtime, &mut prompt_input);
             crate::enhanced::seams::remove_replayed_tool_calls_from_prompt(
                 &runtime,
                 &mut prompt_input,
@@ -1561,6 +1562,15 @@ async fn run_sampling_request(
             .await
             {
                 Ok(()) => {
+                    {
+                        let mut runtime = sess
+                            .enhanced
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner);
+                        crate::enhanced::seams::clear_context_projections_after_compaction(
+                            &mut runtime,
+                        );
+                    }
                     prompt_input = sess
                         .clone_history()
                         .await
@@ -1626,7 +1636,15 @@ async fn run_sampling_request(
                             )
                             .await
                             {
-                                Ok(()) => {}
+                                Ok(()) => {
+                                    let mut runtime = sess
+                                        .enhanced
+                                        .lock()
+                                        .unwrap_or_else(std::sync::PoisonError::into_inner);
+                                    crate::enhanced::seams::clear_context_projections_after_compaction(
+                                        &mut runtime,
+                                    );
+                                }
                                 Err(compact_err)
                                     if matches!(
                                         compact_err.details(),

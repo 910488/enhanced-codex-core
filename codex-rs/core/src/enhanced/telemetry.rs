@@ -17,6 +17,9 @@ pub enum EnhancedEventKind {
     ContextCompactionAvoided,
     ContextOverflowRetry,
     ContextOverflowRetryRefused,
+    ContextProjectionApplied,
+    ContextProjectionRestored,
+    ContextProjectionCleared,
     ContinuationAllowed,
     ContinuationExhausted,
 }
@@ -33,6 +36,9 @@ impl EnhancedEventKind {
             Self::ContextCompactionAvoided => "enhanced.context.compaction_avoided",
             Self::ContextOverflowRetry => "enhanced.context.overflow_retry",
             Self::ContextOverflowRetryRefused => "enhanced.context.overflow_retry_refused",
+            Self::ContextProjectionApplied => "enhanced.context.projection_applied",
+            Self::ContextProjectionRestored => "enhanced.context.projection_restored",
+            Self::ContextProjectionCleared => "enhanced.context.projection_cleared",
             Self::ContinuationAllowed => "enhanced.continuation.allowed",
             Self::ContinuationExhausted => "enhanced.continuation.exhausted",
         }
