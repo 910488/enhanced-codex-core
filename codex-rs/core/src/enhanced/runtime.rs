@@ -42,6 +42,9 @@ pub struct EnhancedSessionRuntime {
     pub ledger_restored: bool,
     pub context_projections: ContextProjectionStore,
     pub pending_repetition_notices: HashSet<String>,
+    /// A repetition notice that must not attach to an already-delivered
+    /// tool result. Applied as a standalone user message on the next prompt.
+    pub pending_standalone_repetition_notice: bool,
 }
 
 impl EnhancedSessionRuntime {
@@ -65,6 +68,7 @@ impl EnhancedSessionRuntime {
             ledger_restored: false,
             context_projections: ContextProjectionStore::load(codex_home.as_ref(), thread_id),
             pending_repetition_notices: HashSet::new(),
+            pending_standalone_repetition_notice: false,
         }
     }
 
@@ -77,6 +81,7 @@ impl EnhancedSessionRuntime {
             ledger_restored: false,
             context_projections: ContextProjectionStore::in_memory(),
             pending_repetition_notices: HashSet::new(),
+            pending_standalone_repetition_notice: false,
         }
     }
 }

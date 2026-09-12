@@ -257,17 +257,18 @@ fn observe_completed_result(
             &handled.identity.namespace,
         ),
     };
-    let emit_notice = {
+    let decision = {
         let (hooks, telemetry) = split_runtime(runtime);
-        hooks
-            .observe_tool_result(call_id, input, telemetry)
-            .emit_model_notice
+        hooks.observe_tool_result(call_id, input, telemetry)
     };
-    if emit_notice {
+    if decision.emit_model_notice {
         runtime
             .pending_repetition_notices
             .insert(call_id.to_string());
         Some(REPETITION_NOTICE.to_string())
+    } else if decision.standalone_notice {
+        runtime.pending_standalone_repetition_notice = true;
+        None
     } else {
         None
     }
@@ -276,6 +277,7 @@ fn observe_completed_result(
 pub(crate) fn on_new_user_input(runtime: &mut EnhancedSessionRuntime) {
     runtime.pending_continuation = None;
     runtime.pending_repetition_notices.clear();
+    runtime.pending_standalone_repetition_notice = false;
     runtime.hooks.on_new_user_input();
 }
 
@@ -286,6 +288,7 @@ pub(crate) fn on_assistant_success(runtime: &mut EnhancedSessionRuntime) {
 pub(crate) fn on_turn_idle(runtime: &mut EnhancedSessionRuntime) {
     runtime.pending_continuation = None;
     runtime.pending_repetition_notices.clear();
+    runtime.pending_standalone_repetition_notice = false;
     runtime.hooks.on_turn_idle();
 }
 
@@ -474,19 +477,37 @@ fn remember_context_projections(
 
 pub(crate) fn apply_repetition_notices(
     runtime: &mut EnhancedSessionRuntime,
-    items: &mut [ResponseItem],
+    items: &mut Vec<ResponseItem>,
 ) {
-    if runtime.pending_repetition_notices.is_empty() {
-        return;
+    if !runtime.pending_repetition_notices.is_empty() {
+        for item in items.iter_mut() {
+            let Some((call_id, text)) = output_identity_and_text(item) else {
+                continue;
+            };
+            if runtime.pending_repetition_notices.contains(call_id)
+                && !text.contains(REPETITION_NOTICE)
+            {
+                replace_output_text(item, format!("{text}\n{REPETITION_NOTICE}"));
+            }
+        }
     }
-    for item in items.iter_mut() {
-        let Some((call_id, text)) = output_identity_and_text(item) else {
-            continue;
-        };
-        if runtime.pending_repetition_notices.contains(call_id)
-            && !text.contains(REPETITION_NOTICE)
-        {
-            replace_output_text(item, format!("{text}\n{REPETITION_NOTICE}"));
+    if runtime.pending_standalone_repetition_notice {
+        runtime.pending_standalone_repetition_notice = false;
+        let already = items.iter().any(|item| match item {
+            ResponseItem::Message { content, .. } => content_text(content).contains(REPETITION_NOTICE),
+            _ => output_identity_and_text(item)
+                .is_some_and(|(_, text)| text.contains(REPETITION_NOTICE)),
+        });
+        if !already {
+            items.push(ResponseItem::Message {
+                id: None,
+                role: "user".into(),
+                content: vec![ContentItem::InputText {
+                    text: REPETITION_NOTICE.to_string(),
+                }],
+                phase: None,
+                internal_chat_message_metadata_passthrough: None,
+            });
         }
     }
 }
@@ -1447,5 +1468,52 @@ mod tests {
         );
         on_new_user_input(&mut runtime);
         assert!(runtime.pending_repetition_notices.is_empty());
+    }
+
+    #[test]
+    fn out_of_order_identical_ops_inject_a_standalone_notice_not_the_late_middle_result() {
+        let mut runtime = EnhancedSessionRuntime::all_off();
+        runtime.hooks = EnhancedTurnHooks::new(AblationProfile::E5.features());
+        runtime.hooks.features.repetition_notice = true;
+        let patch = "*** Begin Patch\nsame\n";
+        let success = "ok";
+        let c0 = custom_call("c0", patch);
+        let c1 = custom_call("c1", patch);
+        let c2 = custom_call("c2", patch);
+        assert!(admit_tool_call(&mut runtime, &c0).is_ok());
+        assert!(admit_tool_call(&mut runtime, &c1).is_ok());
+        assert!(admit_tool_call(&mut runtime, &c2).is_ok());
+        assert!(complete_tool_call_with_result(&mut runtime, "c0", true, Some(success))
+            .unwrap()
+            .is_none());
+        assert!(complete_tool_call_with_result(&mut runtime, "c2", true, Some(success))
+            .unwrap()
+            .is_none());
+        let middle = complete_tool_call_with_result(&mut runtime, "c1", true, Some(success)).unwrap();
+        assert!(
+            middle.is_none(),
+            "must not attach the notice to the late-completing middle result"
+        );
+        assert!(runtime.pending_repetition_notices.is_empty());
+        assert!(runtime.pending_standalone_repetition_notice);
+        let mut items = vec![output_item("c0"), output_item("c2"), output_item("c1")];
+        apply_repetition_notices(&mut runtime, &mut items);
+        assert!(!runtime.pending_standalone_repetition_notice);
+        assert_eq!(output_identity_and_text(&items[2]).unwrap().1, "ok");
+        assert!(
+            matches!(
+                items.last(),
+                Some(ResponseItem::Message { content, role, .. })
+                    if role == "user" && content_text(content) == REPETITION_NOTICE
+            ),
+            "standalone notice must be a separate model-visible message: {:?}",
+            items.last()
+        );
+        assert_eq!(
+            runtime
+                .telemetry
+                .count(EnhancedEventKind::ToolRepetitionNoticeAppended),
+            1
+        );
     }
 }

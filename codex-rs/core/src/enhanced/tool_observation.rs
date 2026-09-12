@@ -298,6 +298,8 @@ pub fn observation_events(decision: &ObservationDecision, call_id: &str) -> Vec<
         observation_reason: Some(decision.reason.as_str().to_string()),
         outcome: Some(if decision.emit_model_notice {
             "notice".into()
+        } else if decision.standalone_notice {
+            "standalone".into()
         } else {
             "diagnostic".into()
         }),
@@ -307,7 +309,7 @@ pub fn observation_events(decision: &ObservationDecision, call_id: &str) -> Vec<
         EnhancedEventKind::ToolRepetitionObserved,
         fields.clone(),
     )];
-    if decision.emit_model_notice {
+    if decision.emit_model_notice || decision.standalone_notice {
         events.push(EnhancedEvent::new(
             EnhancedEventKind::ToolRepetitionNoticeAppended,
             fields,

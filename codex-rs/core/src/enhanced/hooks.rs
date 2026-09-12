@@ -112,11 +112,18 @@ impl EnhancedTurnHooks {
         input: ObservationInput,
         telemetry: &mut MemoryTelemetry,
     ) -> ObservationDecision {
-        let decision = self
+        let mut decision = self
             .observation
             .observe(input, self.features.repetition_notice);
         for event in observation_events(&decision, call_id) {
             telemetry.emit(event);
+        }
+        for deferred in self.observation.take_deferred_notices() {
+            for event in observation_events(&deferred, call_id) {
+                telemetry.emit(event);
+            }
+            decision.emit_diagnostic |= deferred.emit_diagnostic;
+            decision.standalone_notice |= deferred.standalone_notice;
         }
         decision
     }
@@ -394,5 +401,56 @@ mod tests {
         hooks.restore_ledger(&snapshot).unwrap();
         let after_resume = hooks.observe_tool_result("c3", sample(2), &mut telemetry);
         assert_eq!(after_resume.consecutive_count, 1);
+    }
+
+    #[test]
+    fn out_of_order_observe_path_drains_a_standalone_notice() {
+        use super::super::tool_observation::{
+            ObservationInput, ObservationResultStatus, ObservationReason,
+        };
+        use super::super::tool_reliability::ToolKind;
+
+        fn sample(index: u64) -> ObservationInput {
+            ObservationInput {
+                tool_name: "apply_patch".into(),
+                tool_kind: ToolKind::Function,
+                namespace: String::new(),
+                input_fingerprint: "in".into(),
+                original_result_fingerprint: "ok".into(),
+                dispatch_index: index,
+                result_status: ObservationResultStatus::Success,
+                native_wait_poll: false,
+            }
+        }
+
+        let mut hooks = EnhancedTurnHooks::new(AblationProfile::E5.features());
+        hooks.features.repetition_notice = true;
+        let mut telemetry = MemoryTelemetry::default();
+        hooks.observe_tool_result("c0", sample(0), &mut telemetry);
+        let late_high = hooks.observe_tool_result("c2", sample(2), &mut telemetry);
+        assert!(!late_high.emit_model_notice);
+        let middle = hooks.observe_tool_result("c1", sample(1), &mut telemetry);
+        assert!(
+            !middle.emit_model_notice,
+            "must not attach the notice to the late-completing middle result"
+        );
+        assert!(
+            middle.standalone_notice,
+            "observe_tool_result must surface the deferred standalone notice"
+        );
+        assert!(
+            middle.emit_diagnostic,
+            "the deferred diagnostic must reach the observe path"
+        );
+        assert!(hooks.observation.take_deferred_notices().is_empty());
+        assert_eq!(
+            telemetry.count(super::super::telemetry::EnhancedEventKind::ToolRepetitionObserved),
+            1
+        );
+        assert_eq!(
+            telemetry.count(super::super::telemetry::EnhancedEventKind::ToolRepetitionNoticeAppended),
+            1
+        );
+        assert_eq!(middle.reason, ObservationReason::BelowThreshold);
     }
 }
