@@ -36,10 +36,16 @@ use super::telemetry::EnhancedEventFields;
 use super::telemetry::EnhancedEventKind;
 use super::telemetry::MemoryTelemetry;
 use super::telemetry::hash_identifier;
+use super::tool_observation::fingerprint_original_result;
+use super::tool_observation::is_native_wait_poll;
+use super::tool_observation::ObservationInput;
+use super::tool_observation::ObservationResultStatus;
+use super::tool_observation::REPETITION_NOTICE;
 use super::tool_reliability::AdmitDecision;
 use super::tool_reliability::ProviderToolCallIdentity;
 use super::tool_reliability::ToolCallLedger;
 use super::tool_reliability::ToolCallResolution;
+use super::tool_reliability::ToolKind;
 
 pub(crate) enum PressureSeam {
     DeferToUpstream,
@@ -72,18 +78,45 @@ fn log_new_events(telemetry: &MemoryTelemetry, start: usize) {
     }
 }
 
-fn payload_arguments(payload: &ToolPayload) -> String {
-    match payload {
-        ToolPayload::Function { arguments } => arguments.clone(),
-        ToolPayload::Custom { input } => input.clone(),
-        ToolPayload::ToolSearch { arguments } => arguments.query.clone(),
-    }
+fn call_namespace(call: &ToolCall) -> String {
+    super::tool_reliability::canonical_namespace(
+        call.tool_name.namespace.as_deref().unwrap_or(""),
+    )
+    .to_string()
 }
 
 fn identity_from_call(call: &ToolCall) -> ProviderToolCallIdentity {
-    let arguments = payload_arguments(&call.payload);
-    let value = serde_json::from_str::<Value>(&arguments).unwrap_or(Value::String(arguments));
-    ToolCallLedger::identity(call.call_id.clone(), &call.tool_name.name, &value)
+    let namespace = call_namespace(call);
+    match &call.payload {
+        ToolPayload::Function { arguments } => {
+            let value = serde_json::from_str::<Value>(arguments)
+                .unwrap_or_else(|_| Value::String(arguments.clone()));
+            ToolCallLedger::identity_json(
+                call.call_id.clone(),
+                &call.tool_name.name,
+                ToolKind::Function,
+                &namespace,
+                &value,
+            )
+        }
+        ToolPayload::Custom { input } => ToolCallLedger::identity_raw(
+            call.call_id.clone(),
+            &call.tool_name.name,
+            ToolKind::Custom,
+            &namespace,
+            input,
+        ),
+        ToolPayload::ToolSearch { arguments } => {
+            let value = serde_json::json!({ "query": arguments.query });
+            ToolCallLedger::identity_json(
+                call.call_id.clone(),
+                &call.tool_name.name,
+                ToolKind::ToolSearch,
+                &namespace,
+                &value,
+            )
+        }
+    }
 }
 
 /// Sentinel `RespondToModel` payload. `ToolCallRuntime` must drop it instead
@@ -141,10 +174,18 @@ pub(crate) fn complete_tool_call(
     call_id: &str,
     succeeded: bool,
 ) -> Result<(), FunctionCallError> {
-    let synthetic_duplicate = runtime
-        .hooks
-        .ledger
-        .get(call_id)
+    complete_tool_call_with_result(runtime, call_id, succeeded, None).map(|_| ())
+}
+
+pub(crate) fn complete_tool_call_with_result(
+    runtime: &mut EnhancedSessionRuntime,
+    call_id: &str,
+    succeeded: bool,
+    result_text: Option<&str>,
+) -> Result<Option<String>, FunctionCallError> {
+    let handled = runtime.hooks.ledger.get(call_id).cloned();
+    let synthetic_duplicate = handled
+        .as_ref()
         .is_some_and(|handled| handled.synthetic_duplicate_emitted);
     let late = runtime.hooks.ingest_late_tool_result(call_id);
     let original = runtime.hooks.complete_original_tool_result(call_id);
@@ -179,13 +220,62 @@ pub(crate) fn complete_tool_call(
                 ..EnhancedEventFields::default()
             },
         ));
+        let notice = observe_completed_result(runtime, call_id, handled.as_ref(), succeeded, result_text);
         log_new_events(&runtime.telemetry, start);
+        return Ok(notice);
     }
-    Ok(())
+    Ok(None)
+}
+
+fn observe_completed_result(
+    runtime: &mut EnhancedSessionRuntime,
+    call_id: &str,
+    handled: Option<&super::tool_reliability::HandledToolCall>,
+    succeeded: bool,
+    result_text: Option<&str>,
+) -> Option<String> {
+    let Some(handled) = handled else {
+        return None;
+    };
+    let original = result_text.unwrap_or(if succeeded { "success" } else { "failed" });
+    let result_fingerprint = fingerprint_original_result(original, Some(REPETITION_NOTICE));
+    let input = ObservationInput {
+        tool_name: handled.identity.tool_name.clone(),
+        tool_kind: handled.identity.tool_kind,
+        namespace: handled.identity.namespace.clone(),
+        input_fingerprint: handled.identity.argument_fingerprint.clone(),
+        original_result_fingerprint: result_fingerprint,
+        dispatch_index: handled.dispatch_index,
+        result_status: if succeeded {
+            ObservationResultStatus::Success
+        } else {
+            ObservationResultStatus::Failed
+        },
+        native_wait_poll: is_native_wait_poll(
+            &handled.identity.tool_name,
+            handled.identity.tool_kind,
+            &handled.identity.namespace,
+        ),
+    };
+    let emit_notice = {
+        let (hooks, telemetry) = split_runtime(runtime);
+        hooks
+            .observe_tool_result(call_id, input, telemetry)
+            .emit_model_notice
+    };
+    if emit_notice {
+        runtime
+            .pending_repetition_notices
+            .insert(call_id.to_string());
+        Some(REPETITION_NOTICE.to_string())
+    } else {
+        None
+    }
 }
 
 pub(crate) fn on_new_user_input(runtime: &mut EnhancedSessionRuntime) {
     runtime.pending_continuation = None;
+    runtime.pending_repetition_notices.clear();
     runtime.hooks.on_new_user_input();
 }
 
@@ -195,6 +285,7 @@ pub(crate) fn on_assistant_success(runtime: &mut EnhancedSessionRuntime) {
 
 pub(crate) fn on_turn_idle(runtime: &mut EnhancedSessionRuntime) {
     runtime.pending_continuation = None;
+    runtime.pending_repetition_notices.clear();
     runtime.hooks.on_turn_idle();
 }
 
@@ -378,6 +469,25 @@ fn remember_context_projections(
         runtime
             .context_projections
             .record(call_id, &original_text, projected_text);
+    }
+}
+
+pub(crate) fn apply_repetition_notices(
+    runtime: &mut EnhancedSessionRuntime,
+    items: &mut [ResponseItem],
+) {
+    if runtime.pending_repetition_notices.is_empty() {
+        return;
+    }
+    for item in items.iter_mut() {
+        let Some((call_id, text)) = output_identity_and_text(item) else {
+            continue;
+        };
+        if runtime.pending_repetition_notices.contains(call_id)
+            && !text.contains(REPETITION_NOTICE)
+        {
+            replace_output_text(item, format!("{text}\n{REPETITION_NOTICE}"));
+        }
     }
 }
 
@@ -689,11 +799,22 @@ pub(crate) async fn maybe_continue_turn(
     items: &[ResponseItem],
     cancellation_token: &CancellationToken,
     user_steer_pending: bool,
+    last_agent_message: Option<String>,
 ) -> bool {
+    let intent_continuation_enabled = sess
+        .enhanced
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .hooks
+        .features
+        .intent_continuation;
     let context = TurnStopContext {
         cancelled: cancellation_token.is_cancelled(),
         user_steer_pending,
         unfinished: unfinished_from_items(items),
+        intent_continuation_enabled,
+        natural_stop: true,
+        assistant_final_text: last_agent_message,
     };
     let (plan, reserved) = {
         let mut runtime = sess
@@ -806,9 +927,13 @@ fn ledger_from_history(items: &[ResponseItem]) -> ToolCallLedger {
                 input,
                 ..
             } => {
-                let value = serde_json::from_str::<Value>(input)
-                    .unwrap_or_else(|_| Value::String(input.clone()));
-                let identity = ToolCallLedger::identity(call_id.clone(), name, &value);
+                let identity = ToolCallLedger::identity_raw(
+                    call_id.clone(),
+                    name,
+                    ToolKind::Custom,
+                    "",
+                    input,
+                );
                 let _ = ledger.admit(identity);
             }
             ResponseItem::FunctionCallOutput {
@@ -1152,5 +1277,175 @@ mod tests {
         assert!(is_drop_tool_output(
             forwarded.as_ref().expect_err("late original must drop")
         ));
+    }
+
+    fn custom_call(call_id: &str, input: &str) -> crate::tools::router::ToolCall {
+        crate::tools::router::ToolCall {
+            tool_name: codex_tools::ToolName::plain("apply_patch"),
+            call_id: call_id.into(),
+            payload: ToolPayload::Custom {
+                input: input.into(),
+            },
+            encrypted_function_args: None,
+        }
+    }
+
+    fn shell_call(call_id: &str, cmd: &str) -> crate::tools::router::ToolCall {
+        crate::tools::router::ToolCall {
+            tool_name: codex_tools::ToolName::plain("shell"),
+            call_id: call_id.into(),
+            payload: ToolPayload::Function {
+                arguments: json!({"cmd": cmd}).to_string(),
+            },
+            encrypted_function_args: None,
+        }
+    }
+
+    #[test]
+    fn custom_input_keeps_whitespace_and_is_not_json_canonicalized() {
+        let mut runtime = EnhancedSessionRuntime::all_off();
+        runtime.hooks = EnhancedTurnHooks::new(AblationProfile::E1.features());
+        let patch = "*** Begin Patch\n*** Update File: a.rs\n@@\n- old\n+ 新\n";
+        assert!(admit_tool_call(&mut runtime, &custom_call("c1", patch)).is_ok());
+        let stored = runtime.hooks.ledger.get("c1").unwrap();
+        assert_eq!(stored.identity.tool_kind, ToolKind::Custom);
+        assert_eq!(
+            stored.identity.argument_fingerprint,
+            ToolCallLedger::fingerprint_raw("apply_patch", ToolKind::Custom, "", patch)
+        );
+        let collapsed = "*** Begin Patch\n*** Update File: a.rs\n@@\n-old\n+新\n";
+        assert_ne!(
+            stored.identity.argument_fingerprint,
+            ToolCallLedger::fingerprint_raw("apply_patch", ToolKind::Custom, "", collapsed)
+        );
+    }
+
+    #[test]
+    fn distinct_patches_with_the_same_success_are_not_blocked() {
+        let mut runtime = EnhancedSessionRuntime::all_off();
+        runtime.hooks = EnhancedTurnHooks::new(AblationProfile::E5.features());
+        let success = "Success. Updated the following files:\nM src-tauri/src/commands/runtime.rs";
+        for (index, patch) in [
+            "*** Begin Patch\nA\n",
+            "*** Begin Patch\nB\n",
+            "*** Begin Patch\nC\n",
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let call = custom_call(&format!("p{index}"), patch);
+            assert!(admit_tool_call(&mut runtime, &call).is_ok());
+            assert!(complete_tool_call_with_result(&mut runtime, &call.call_id, true, Some(success))
+                .unwrap()
+                .is_none());
+        }
+        assert!(runtime.pending_repetition_notices.is_empty());
+        assert_eq!(
+            runtime
+                .telemetry
+                .count(EnhancedEventKind::ToolRepetitionObserved),
+            0
+        );
+    }
+
+    #[test]
+    fn twenty_five_distinct_ops_without_assistant_text_are_not_blocked() {
+        let mut runtime = EnhancedSessionRuntime::all_off();
+        runtime.hooks = EnhancedTurnHooks::new(AblationProfile::E5.features());
+        for index in 0..25 {
+            let call = shell_call(&format!("op{index}"), &format!("step-{index}"));
+            assert!(admit_tool_call(&mut runtime, &call).is_ok());
+            assert!(complete_tool_call_with_result(
+                &mut runtime,
+                &call.call_id,
+                true,
+                Some("ok")
+            )
+            .unwrap()
+            .is_none());
+        }
+        assert!(runtime.pending_repetition_notices.is_empty());
+        let plan = {
+            let (hooks, telemetry) = split_runtime(&mut runtime);
+            hooks.on_turn_stop(
+                &TurnStopContext {
+                    natural_stop: true,
+                    assistant_final_text: None,
+                    ..TurnStopContext::default()
+                },
+                telemetry,
+            )
+        };
+        assert!(matches!(
+            plan,
+            HookDecision::Handled(ref inner) if inner.decision == ContinuationDecision::AllowStop
+        ));
+    }
+
+    #[test]
+    fn flags_off_scripted_path_does_not_inject_notice_or_text_continuation() {
+        let mut runtime = EnhancedSessionRuntime::all_off();
+        runtime.hooks = EnhancedTurnHooks::new(AblationProfile::E5.features());
+        let patch = "*** Begin Patch\nsame\n";
+        let success = "ok";
+        for index in 0..3 {
+            let call = custom_call(&format!("same{index}"), patch);
+            assert!(admit_tool_call(&mut runtime, &call).is_ok());
+            let notice = complete_tool_call_with_result(
+                &mut runtime,
+                &call.call_id,
+                true,
+                Some(success),
+            )
+            .unwrap();
+            assert!(notice.is_none());
+        }
+        assert!(runtime.pending_repetition_notices.is_empty());
+        assert_eq!(
+            runtime
+                .telemetry
+                .count(EnhancedEventKind::ToolRepetitionNoticeAppended),
+            0
+        );
+        let mut items = vec![output_item("same2")];
+        apply_repetition_notices(&mut runtime, &mut items);
+        assert_eq!(output_identity_and_text(&items[0]).unwrap().1, "ok");
+        let plan = {
+            let (hooks, telemetry) = split_runtime(&mut runtime);
+            hooks.on_turn_stop(
+                &TurnStopContext {
+                    intent_continuation_enabled: false,
+                    natural_stop: true,
+                    assistant_final_text: Some("I will continue immediately.".into()),
+                    ..TurnStopContext::default()
+                },
+                telemetry,
+            )
+        };
+        assert!(matches!(
+            plan,
+            HookDecision::Handled(ref inner) if inner.decision == ContinuationDecision::AllowStop
+        ));
+    }
+
+    #[test]
+    fn scripted_provider_path_admits_executes_observes_and_stops() {
+        let mut runtime = EnhancedSessionRuntime::all_off();
+        runtime.hooks = EnhancedTurnHooks::new(AblationProfile::E1.features());
+        let call = shell_call("wired", "echo hi");
+        assert!(admit_tool_call(&mut runtime, &call).is_ok());
+        assert!(complete_tool_call_with_result(&mut runtime, "wired", true, Some("hi")).is_ok());
+        assert_eq!(
+            runtime.telemetry.count(EnhancedEventKind::ToolCallAdmitted),
+            1
+        );
+        assert_eq!(
+            runtime
+                .telemetry
+                .count(EnhancedEventKind::ToolCallCompleted),
+            1
+        );
+        on_new_user_input(&mut runtime);
+        assert!(runtime.pending_repetition_notices.is_empty());
     }
 }

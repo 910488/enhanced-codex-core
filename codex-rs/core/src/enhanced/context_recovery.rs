@@ -1,10 +1,7 @@
-use super::context_pruner::ModelVisibleSurface;
-use super::context_pruner::PruneOutcome;
-use super::context_pruner::ToolResultPrunePolicy;
-use super::context_pruner::apply_pressure_prune;
-use super::telemetry::EnhancedEvent;
-use super::telemetry::EnhancedEventFields;
-use super::telemetry::EnhancedEventKind;
+use super::context_pruner::{
+    apply_pressure_prune, ModelVisibleSurface, PruneOutcome, ToolResultPrunePolicy,
+};
+use super::telemetry::{EnhancedEvent, EnhancedEventFields, EnhancedEventKind};
 
 pub const MAX_CONTEXT_OVERFLOW_RETRIES: u8 = 1;
 
@@ -132,8 +129,7 @@ fn refused(retry_index: u8) -> OverflowPlan {
 
 #[cfg(test)]
 mod tests {
-    use super::super::context_pruner::ContentBlock;
-    use super::super::context_pruner::SurfaceItem;
+    use super::super::context_pruner::{ContentBlock, SurfaceItem};
     use super::*;
 
     fn surface(chars: usize, generation: u64) -> ModelVisibleSurface {

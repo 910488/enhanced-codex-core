@@ -394,11 +394,14 @@ impl ToolRouter {
                 .enhanced
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
-            crate::enhanced::seams::complete_tool_call(
+            let result_text = result.as_ref().ok().map(|output| output.result.log_output());
+            crate::enhanced::seams::complete_tool_call_with_result(
                 &mut runtime,
                 &ledger_call_id,
                 result.is_ok(),
+                result_text.as_deref(),
             )
+            .map(|_| ())
         };
         match complete {
             Ok(()) => result,

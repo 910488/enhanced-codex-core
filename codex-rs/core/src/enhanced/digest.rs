@@ -1,7 +1,5 @@
-use serde::Deserialize;
-use serde::Serialize;
-use sha2::Digest;
-use sha2::Sha256;
+use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 
 use super::config::EnhancedRuntimeFeatures;
 
@@ -13,7 +11,6 @@ pub struct DigestInputs {
     pub qwen_source_commit: String,
     pub deepseek_source_commit: String,
     pub feature_defaults: EnhancedRuntimeFeatures,
-    pub app_server_protocol_hash: String,
     pub build_profile: String,
     pub target_triple: String,
     pub artifact_sha256: String,
@@ -58,9 +55,6 @@ impl DigestInputs {
                     value: value.to_string(),
                 });
             }
-        }
-        if self.app_server_protocol_hash.trim().is_empty() {
-            return Err(DigestError::Incomplete("appServerProtocolHash"));
         }
         if self.build_profile.trim().is_empty() {
             return Err(DigestError::Incomplete("buildProfile"));
@@ -123,8 +117,13 @@ pub fn compute_runtime_digest(inputs: &DigestInputs) -> Result<String, DigestErr
     );
     feed(
         &mut hasher,
-        "appServerProtocolHash",
-        &inputs.app_server_protocol_hash,
+        "repetitionNotice",
+        bool_flag(inputs.feature_defaults.repetition_notice),
+    );
+    feed(
+        &mut hasher,
+        "intentContinuation",
+        bool_flag(inputs.feature_defaults.intent_continuation),
     );
     feed(&mut hasher, "buildProfile", &inputs.build_profile);
     feed(&mut hasher, "targetTriple", &inputs.target_triple);
@@ -133,7 +132,11 @@ pub fn compute_runtime_digest(inputs: &DigestInputs) -> Result<String, DigestErr
 }
 
 fn bool_flag(value: bool) -> &'static str {
-    if value { "1" } else { "0" }
+    if value {
+        "1"
+    } else {
+        "0"
+    }
 }
 
 fn feed(hasher: &mut Sha256, key: &str, value: &str) {
@@ -155,8 +158,6 @@ mod tests {
             qwen_source_commit: "cccccccccccccccccccccccccccccccccccccccc".into(),
             deepseek_source_commit: "dddddddddddddddddddddddddddddddddddddddd".into(),
             feature_defaults: EnhancedRuntimeFeatures::all_on(),
-            app_server_protocol_hash:
-                "sha256:eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee".into(),
             build_profile: "enhanced-mvp-v1".into(),
             target_triple: "x86_64-pc-windows-msvc".into(),
             artifact_sha256:
@@ -176,6 +177,12 @@ mod tests {
         artifact.artifact_sha256 =
             "sha256:0000000000000000000000000000000000000000000000000000000000000001".into();
         assert_ne!(first, compute_runtime_digest(&artifact).unwrap());
+        let mut notice = sample();
+        notice.feature_defaults.repetition_notice = true;
+        assert_ne!(first, compute_runtime_digest(&notice).unwrap());
+        let mut intent = sample();
+        intent.feature_defaults.intent_continuation = true;
+        assert_ne!(first, compute_runtime_digest(&intent).unwrap());
     }
 
     #[test]

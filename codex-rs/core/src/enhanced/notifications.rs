@@ -10,14 +10,11 @@
 //! invent a field the bridge will refuse — and so the contract can be tested
 //! without a fork build.
 
-use serde::Deserialize;
-use serde::Serialize;
-use serde_json::Map;
-use serde_json::Value;
+use serde::{Deserialize, Serialize};
+use serde_json::{Map, Value};
 
 use super::config::EnhancedRuntimeFeatures;
-use super::telemetry::EnhancedEvent;
-use super::telemetry::field_name_is_forbidden;
+use super::telemetry::{field_name_is_forbidden, EnhancedEvent};
 
 pub const ENHANCED_IDENTITY_NOTIFICATION: &str = "vellum/enhancedRuntimeIdentity";
 pub const ENHANCED_EVENT_NOTIFICATION: &str = "vellum/enhancedEvent";
@@ -40,6 +37,10 @@ pub struct EnhancedPortFlags {
     pub qwen_tool_reliability: bool,
     pub deepseek_context_recovery: bool,
     pub qwen_bounded_continuation: bool,
+    #[serde(default)]
+    pub repetition_notice: bool,
+    #[serde(default)]
+    pub intent_continuation: bool,
 }
 
 impl From<EnhancedRuntimeFeatures> for EnhancedPortFlags {
@@ -48,6 +49,8 @@ impl From<EnhancedRuntimeFeatures> for EnhancedPortFlags {
             qwen_tool_reliability: value.qwen_tool_reliability,
             deepseek_context_recovery: value.deepseek_context_recovery,
             qwen_bounded_continuation: value.qwen_bounded_continuation,
+            repetition_notice: value.repetition_notice,
+            intent_continuation: value.intent_continuation,
         }
     }
 }
@@ -94,8 +97,7 @@ pub fn event_notification(event: &EnhancedEvent) -> Value {
 #[cfg(test)]
 mod tests {
     use super::super::config::AblationProfile;
-    use super::super::telemetry::EnhancedEventFields;
-    use super::super::telemetry::EnhancedEventKind;
+    use super::super::telemetry::{EnhancedEventFields, EnhancedEventKind};
     use super::*;
 
     #[test]
@@ -111,7 +113,21 @@ mod tests {
         assert_eq!(ports["qwenToolReliability"], true);
         assert_eq!(ports["deepseekContextRecovery"], true);
         assert_eq!(ports["qwenBoundedContinuation"], false);
+        assert_eq!(ports["repetitionNotice"], false);
+        assert_eq!(ports["intentContinuation"], false);
         assert_eq!(notification["params"]["featureProfile"], "E4");
+    }
+
+    #[test]
+    fn identity_reports_experimental_flags_explicitly_when_set() {
+        let mut features = AblationProfile::E5.features();
+        features.repetition_notice = true;
+        features.intent_continuation = true;
+        let notification = identity_notification("c".repeat(40), "sha256:digest", "custom", features);
+        let ports = &notification["params"]["ports"];
+        assert_eq!(ports["repetitionNotice"], true);
+        assert_eq!(ports["intentContinuation"], true);
+        assert_eq!(ports["qwenBoundedContinuation"], true);
     }
 
     #[test]

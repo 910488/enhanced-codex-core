@@ -607,6 +607,7 @@ pub(crate) async fn run_turn(
                             &sampling_request_input,
                             &cancellation_token,
                             /*user_steer_pending*/ false,
+                            last_agent_message.clone(),
                         )
                         .await
                     {
@@ -1512,6 +1513,7 @@ async fn run_sampling_request(
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
             crate::enhanced::seams::apply_context_projections(&mut runtime, &mut prompt_input);
+            crate::enhanced::seams::apply_repetition_notices(&mut runtime, &mut prompt_input);
             crate::enhanced::seams::remove_replayed_tool_calls_from_prompt(
                 &runtime,
                 &mut prompt_input,

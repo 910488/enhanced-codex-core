@@ -176,7 +176,6 @@ impl EnhancedRuntimeLockFile {
             qwen_source_commit: self.qwen_code_source_commit.clone(),
             deepseek_source_commit: self.deepseek_harness_source_commit.clone(),
             feature_defaults,
-            app_server_protocol_hash: self.app_server_protocol_hash.clone(),
             build_profile: self.build_profile.clone(),
             target_triple,
             artifact_sha256: artifact.to_string(),

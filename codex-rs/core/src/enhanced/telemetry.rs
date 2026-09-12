@@ -1,7 +1,5 @@
-use serde::Deserialize;
-use serde::Serialize;
-use sha2::Digest;
-use sha2::Sha256;
+use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 
 use super::config::AblationProfile;
 
@@ -21,13 +19,16 @@ pub enum EnhancedEventKind {
     ContextCompactionAvoided,
     ContextOverflowRetry,
     ContextOverflowRetryRefused,
+    ContextPressureChecked,
     ContextProjectionApplied,
     ContextProjectionRestored,
     ContextProjectionCleared,
-    ContextPressureChecked,
     ContinuationEvaluated,
     ContinuationAllowed,
     ContinuationExhausted,
+    ToolRepetitionObserved,
+    ToolRepetitionNoticeAppended,
+    IntentContinuationDetected,
 }
 
 impl EnhancedEventKind {
@@ -51,6 +52,9 @@ impl EnhancedEventKind {
             Self::ContinuationEvaluated => "enhanced.continuation.evaluated",
             Self::ContinuationAllowed => "enhanced.continuation.allowed",
             Self::ContinuationExhausted => "enhanced.continuation.exhausted",
+            Self::ToolRepetitionObserved => "enhanced.tool.repetition_observed",
+            Self::ToolRepetitionNoticeAppended => "enhanced.tool.repetition_notice_appended",
+            Self::IntentContinuationDetected => "enhanced.continuation.intent_detected",
         }
     }
 }
@@ -73,6 +77,10 @@ pub struct EnhancedEventFields {
     pub unfinished_signal_count: Option<u64>,
     pub outcome: Option<String>,
     pub succeeded: Option<bool>,
+    pub consecutive_count: Option<u8>,
+    pub input_fingerprint_hash: Option<String>,
+    pub result_fingerprint_hash: Option<String>,
+    pub observation_reason: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -112,6 +120,8 @@ const FORBIDDEN_FIELD_NAMES: &[&str] = &[
     "user_text",
     "reasoning",
     "encrypted_content",
+    "patch",
+    "raw_patch",
 ];
 
 pub fn field_name_is_forbidden(name: &str) -> bool {
@@ -194,5 +204,10 @@ mod tests {
         assert!(!field_name_is_forbidden("request_index"));
         assert!(!field_name_is_forbidden("beforeTokenEstimate"));
         assert!(!field_name_is_forbidden("threadIdHash"));
+        assert!(field_name_is_forbidden("patch"));
+        assert!(field_name_is_forbidden("rawPatch"));
+        assert!(!field_name_is_forbidden("inputFingerprintHash"));
+        assert!(!field_name_is_forbidden("consecutiveCount"));
+        assert!(!field_name_is_forbidden("observationReason"));
     }
 }

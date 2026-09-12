@@ -4,6 +4,7 @@
 //! (`ToolRouter`, native compact, stop-hook continuation). They do not
 //! call portable unit functions.
 
+use std::fs;
 use std::time::Duration;
 
 use std::sync::Arc;
@@ -15,10 +16,18 @@ use codex_core::compact::SUMMARIZATION_PROMPT;
 use codex_features::Feature;
 use codex_model_provider_info::built_in_model_providers;
 use codex_protocol::config_types::AutoCompactTokenLimitScope;
+use codex_protocol::config_types::CollaborationMode;
+use codex_protocol::config_types::ModeKind;
+use codex_protocol::config_types::Settings;
 use codex_protocol::error::CodexErr;
+use codex_protocol::models::PermissionProfile;
+use codex_protocol::protocol::AskForApproval;
 use codex_protocol::protocol::EventMsg;
+use codex_protocol::protocol::Op;
+use codex_protocol::protocol::ThreadSettingsOverrides;
 use codex_protocol::user_input::UserInput;
 use core_test_support::responses::ResponsesRequest;
+use core_test_support::responses::ev_apply_patch_custom_tool_call;
 use core_test_support::responses::ev_assistant_message;
 use core_test_support::responses::ev_completed;
 use core_test_support::responses::ev_function_call;
@@ -29,10 +38,13 @@ use core_test_support::responses::sse;
 use core_test_support::responses::sse_failed;
 use core_test_support::responses::sse_response;
 use core_test_support::responses::start_mock_server;
+use core_test_support::TempDirExt;
 use core_test_support::skip_if_no_network;
 use core_test_support::test_codex::TestCodex;
 use core_test_support::test_codex::TestCodexBuilder;
+use core_test_support::test_codex::local_selections;
 use core_test_support::test_codex::test_codex;
+use core_test_support::test_codex::turn_permission_fields;
 use core_test_support::wait_for_event_with_timeout;
 use serde_json::Value;
 use serde_json::json;
@@ -436,6 +448,228 @@ async fn bounded_continuation_prestream_failure_then_two_successes_no_third_inne
         requests.len(),
         5,
         "plan + follow-up + failed continue + continue#1 + continue#2; extra request would be a third continuation"
+    );
+    Ok(())
+}
+
+const REPETITION_NOTICE: &str = "Notice: the same tool, input, and original result have now occurred three times in a row. Consider a different approach.";
+
+fn completed_plan_args() -> String {
+    json!({
+        "explanation": "agent-loop fixture",
+        "plan": [{"step": "Finish", "status": "completed"}],
+    })
+    .to_string()
+}
+
+fn request_contains_notice(request: &ResponsesRequest) -> bool {
+    request.body_contains_text(REPETITION_NOTICE)
+}
+
+async fn submit_unrestricted(test: &TestCodex, text: &str) -> Result<()> {
+    let cwd_path = test.cwd.abs();
+    let (sandbox_policy, permission_profile) =
+        turn_permission_fields(PermissionProfile::Disabled, cwd_path.as_path());
+    test.codex
+        .start_or_steer_turn(
+            TurnInputRequest::user_input(vec![UserInput::Text {
+                text: text.into(),
+                text_elements: Vec::new(),
+            }])
+            .with_thread_settings(ThreadSettingsOverrides {
+                environments: Some(local_selections(cwd_path)),
+                approval_policy: Some(AskForApproval::Never),
+                sandbox_policy: Some(sandbox_policy),
+                permission_profile,
+                collaboration_mode: Some(CollaborationMode {
+                    mode: ModeKind::Default,
+                    settings: Settings {
+                        model: test.session_configured.model.clone(),
+                        reasoning_effort: None,
+                        developer_instructions: None,
+                    },
+                }),
+                ..Default::default()
+            }),
+        )
+        .await?;
+    Ok(())
+}
+
+/// E5 keeps new experiments off. Three identical successful tools plus a
+/// trailing "I will continue immediately." must not inject a model-visible
+/// notice or an extra text-continuation request.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn flags_off_scripted_stream_injects_neither_notice_nor_text_continuation() -> Result<()> {
+    skip_if_no_network!(Ok(()));
+    Box::pin(flags_off_scripted_stream_injects_neither_notice_nor_text_continuation_inner()).await
+}
+
+async fn flags_off_scripted_stream_injects_neither_notice_nor_text_continuation_inner() -> Result<()>
+{
+    let server = start_mock_server().await;
+    let args = completed_plan_args();
+    let request_log = mount_sse_sequence(
+        &server,
+        vec![
+            sse(vec![
+                ev_response_created("resp-tools"),
+                ev_function_call("obs-1", "update_plan", &args),
+                ev_function_call("obs-2", "update_plan", &args),
+                ev_function_call("obs-3", "update_plan", &args),
+                ev_completed("resp-tools"),
+            ]),
+            assistant_sse("resp-final", "I will continue immediately."),
+        ],
+    )
+    .await;
+
+    let mut builder = enhanced_builder("E5");
+    let test = Box::pin(builder.build(&server)).await?;
+    submit_text(&test, "run three identical completed plans").await?;
+    let plan_updates = wait_turn_complete(&test.codex).await;
+    assert_eq!(plan_updates, 3, "all three new-id plan calls must execute");
+
+    let requests = request_log.requests();
+    assert_eq!(
+        requests.len(),
+        2,
+        "flags-off must not open a third (text-continuation) stream; got {}",
+        requests.len()
+    );
+    assert!(
+        requests.iter().all(|request| !contains_nudge(request)),
+        "intentContinuation is off; CONTINUE_NUDGE must not appear"
+    );
+    assert!(
+        requests
+            .iter()
+            .all(|request| !request_contains_notice(request)),
+        "repetitionNotice is off; model-visible notice must not appear"
+    );
+    Ok(())
+}
+
+/// Duplicate same-ID apply_patch in one SSE body executes once in the temp
+/// workdir. A later replay of that call_id must not rewrite the file.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn scripted_stream_runs_apply_patch_once_and_suppresses_same_id_replay() -> Result<()> {
+    skip_if_no_network!(Ok(()));
+    Box::pin(scripted_stream_runs_apply_patch_once_and_suppresses_same_id_replay_inner()).await
+}
+
+async fn scripted_stream_runs_apply_patch_once_and_suppresses_same_id_replay_inner() -> Result<()> {
+    let server = start_mock_server().await;
+    let patch = "*** Begin Patch\n*** Add File: marker.txt\n+from-scripted-stream\n*** End Patch";
+    let request_log = mount_sse_sequence(
+        &server,
+        vec![
+            sse(vec![
+                ev_response_created("resp-patch"),
+                ev_apply_patch_custom_tool_call("patch-1", patch),
+                ev_apply_patch_custom_tool_call("patch-1", patch),
+                ev_completed("resp-patch"),
+            ]),
+            assistant_sse("resp-after-patch", "patch applied"),
+            sse(vec![
+                ev_response_created("resp-replay"),
+                ev_apply_patch_custom_tool_call("patch-1", patch),
+                ev_completed("resp-replay"),
+            ]),
+            assistant_sse("resp-after-replay", "replay suppressed"),
+        ],
+    )
+    .await;
+
+    let mut builder = enhanced_builder("E1");
+    let test = Box::pin(builder.build(&server)).await?;
+    let marker = test.cwd.path().join("marker.txt");
+
+    submit_unrestricted(&test, "apply the marker patch").await?;
+    wait_turn_complete(&test.codex).await;
+    let first = fs::read_to_string(&marker).expect("apply_patch must create marker.txt");
+    assert_eq!(first.trim(), "from-scripted-stream");
+
+    submit_unrestricted(&test, "replay the same call id").await?;
+    wait_turn_complete(&test.codex).await;
+    let second = fs::read_to_string(&marker).expect("marker.txt must still exist");
+    assert_eq!(
+        second, first,
+        "same-id replay must not re-apply the patch (duplicate side effect)"
+    );
+
+    let requests = request_log.requests();
+    let outputs: usize = requests
+        .iter()
+        .map(|request| {
+            request
+                .input()
+                .iter()
+                .filter(|item| {
+                    item.get("type").and_then(Value::as_str) == Some("custom_tool_call_output")
+                        && item.get("call_id").and_then(Value::as_str) == Some("patch-1")
+                })
+                .count()
+        })
+        .sum();
+    assert!(
+        outputs >= 1,
+        "the original apply_patch result must reach the next request; got {outputs} across {} requests",
+        requests.len()
+    );
+    Ok(())
+}
+
+/// Interrupt while the model stream is outstanding must not start a
+/// continuation (or any other) follow-up request.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn cancel_during_stream_starts_no_new_request() -> Result<()> {
+    skip_if_no_network!(Ok(()));
+    Box::pin(cancel_during_stream_starts_no_new_request_inner()).await
+}
+
+async fn cancel_during_stream_starts_no_new_request_inner() -> Result<()> {
+    let server = start_mock_server().await;
+    let delayed = sse_response(assistant_sse("resp-slow", "I will continue immediately."))
+        .set_delay(Duration::from_secs(60));
+    let request_log = mount_response_sequence(&server, vec![delayed]).await;
+
+    let mut builder = enhanced_builder("E5");
+    let test = Box::pin(builder.build(&server)).await?;
+    submit_text(&test, "start a turn we will cancel").await?;
+    let deadline = tokio::time::Instant::now() + TURN_TIMEOUT;
+    loop {
+        if !request_log.requests().is_empty() {
+            break;
+        }
+        if tokio::time::Instant::now() >= deadline {
+            panic!("timed out waiting for the first sampling request");
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    let in_flight = request_log.requests().len();
+    test.codex.submit(Op::Interrupt).await?;
+    wait_for_event_with_timeout(
+        &test.codex,
+        |event| matches!(event, EventMsg::TurnAborted(_)),
+        TURN_TIMEOUT,
+    )
+    .await;
+
+    let requests = request_log.requests();
+    assert_eq!(
+        requests.len(),
+        in_flight,
+        "cancel must not start a new request after interrupt; before={in_flight} after={}",
+        requests.len()
+    );
+    assert_eq!(
+        in_flight, 1,
+        "the cancelled turn should have exactly one outstanding sampling request"
+    );
+    assert!(
+        requests.iter().all(|request| !contains_nudge(request)),
+        "cancel must not emit a continuation nudge request"
     );
     Ok(())
 }

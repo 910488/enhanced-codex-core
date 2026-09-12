@@ -1,9 +1,6 @@
-use serde::Deserialize;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
-use super::telemetry::EnhancedEvent;
-use super::telemetry::EnhancedEventFields;
-use super::telemetry::EnhancedEventKind;
+use super::telemetry::{EnhancedEvent, EnhancedEventFields, EnhancedEventKind};
 
 pub const MAX_AUTO_CONTINUATIONS: u8 = 2;
 
@@ -15,6 +12,7 @@ pub enum UnfinishedSignal {
     NativePlanIncomplete,
     NativeSubagentWorkRemaining,
     StructuredPendingWork,
+    IntentToContinue,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -57,6 +55,14 @@ pub struct TurnStopContext {
     pub cancelled: bool,
     pub user_steer_pending: bool,
     pub unfinished: Vec<UnfinishedSignal>,
+    /// Experimental. Default false; not implied by E5.
+    pub intent_continuation_enabled: bool,
+    /// True only for a natural model stop. Tool-call stops must not consult
+    /// assistant text.
+    pub natural_stop: bool,
+    /// Assistant final text for the natural stop. Reasoning, tool results,
+    /// and quoted content are not supplied here.
+    pub assistant_final_text: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -101,12 +107,22 @@ pub fn plan_turn_stop(
             events: Vec::new(),
         };
     }
-    let has_unfinished = context
+    let mut unfinished = context
         .unfinished
         .iter()
         .copied()
-        .any(|signal| signal != UnfinishedSignal::NativeSubagentWorkRemaining);
-    if !has_unfinished {
+        .filter(|signal| *signal != UnfinishedSignal::NativeSubagentWorkRemaining)
+        .collect::<Vec<_>>();
+    let intent_detected = context.intent_continuation_enabled
+        && context.natural_stop
+        && context
+            .assistant_final_text
+            .as_deref()
+            .is_some_and(trailing_intent_to_continue);
+    if intent_detected && !unfinished.contains(&UnfinishedSignal::IntentToContinue) {
+        unfinished.push(UnfinishedSignal::IntentToContinue);
+    }
+    if unfinished.is_empty() {
         return ContinuationPlan {
             decision: ContinuationDecision::AllowStop,
             reservation: None,
@@ -129,17 +145,91 @@ pub fn plan_turn_stop(
     }
     let index = consumed.saturating_add(1);
     budget.reserved = Some(index);
+    let mut events = Vec::new();
+    if intent_detected {
+        events.push(EnhancedEvent::new(
+            EnhancedEventKind::IntentContinuationDetected,
+            EnhancedEventFields {
+                continuation_index: Some(index),
+                observation_reason: Some("trailing_continue_immediately".into()),
+                ..EnhancedEventFields::default()
+            },
+        ));
+    }
+    events.push(EnhancedEvent::new(
+        EnhancedEventKind::ContinuationAllowed,
+        EnhancedEventFields {
+            continuation_index: Some(index),
+            ..EnhancedEventFields::default()
+        },
+    ));
     ContinuationPlan {
         decision: ContinuationDecision::Continue { index },
         reservation: Some(ReservedContinuation { index }),
-        events: vec![EnhancedEvent::new(
-            EnhancedEventKind::ContinuationAllowed,
-            EnhancedEventFields {
-                continuation_index: Some(index),
-                ..EnhancedEventFields::default()
-            },
-        )],
+        events,
     }
+}
+
+/// Conservative English trailing-continue detector. First version ports only
+/// the upstream short-sentence "will continue immediately" family. No Chinese
+/// semantic classes and no LLM judge.
+pub fn trailing_intent_to_continue(text: &str) -> bool {
+    let last = last_unquoted_sentence(text);
+    if last.is_empty() || last.len() > 80 {
+        return false;
+    }
+    matches!(
+        normalize_sentence(&last).as_str(),
+        "i will continue immediately"
+            | "i'll continue immediately"
+            | "i will continue now"
+            | "i'll continue now"
+            | "let me continue immediately"
+            | "continuing immediately"
+    )
+}
+
+fn last_unquoted_sentence(text: &str) -> String {
+    let trimmed = text.trim();
+    if trimmed.is_empty() {
+        return String::new();
+    }
+    let last_line = trimmed
+        .lines()
+        .rev()
+        .find(|line| !line.trim().is_empty())
+        .unwrap_or("")
+        .trim();
+    if is_quoted(last_line) {
+        return String::new();
+    }
+    let mut start = 0;
+    for (index, character) in last_line.char_indices() {
+        if matches!(character, '.' | '!' | '?') {
+            let next = index + character.len_utf8();
+            if !last_line[next..].trim().is_empty() {
+                start = next;
+            }
+        }
+    }
+    last_line[start..].trim().to_string()
+}
+
+fn is_quoted(text: &str) -> bool {
+    let trimmed = text.trim();
+    let bytes = trimmed.as_bytes();
+    bytes.len() >= 2
+        && ((bytes[0] == b'"' && bytes[bytes.len() - 1] == b'"')
+            || (bytes[0] == b'\'' && bytes[bytes.len() - 1] == b'\''))
+}
+
+fn normalize_sentence(text: &str) -> String {
+    text.trim()
+        .trim_end_matches(['.', '!', ','])
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .to_ascii_lowercase()
 }
 
 pub fn commit_continuation(
@@ -295,5 +385,127 @@ mod tests {
         let again = plan_turn_stop(&mut budget, &completed);
         assert_eq!(again.decision, ContinuationDecision::AllowStop);
         assert!(budget.used <= MAX_AUTO_CONTINUATIONS);
+    }
+
+    fn intent_stop(text: &str) -> TurnStopContext {
+        TurnStopContext {
+            intent_continuation_enabled: true,
+            natural_stop: true,
+            assistant_final_text: Some(text.into()),
+            ..TurnStopContext::default()
+        }
+    }
+
+    #[test]
+    fn intent_continuation_default_off_does_not_add_text_continuation() {
+        let mut budget = AutoContinuationBudget::default();
+        let plan = plan_turn_stop(
+            &mut budget,
+            &TurnStopContext {
+                natural_stop: true,
+                assistant_final_text: Some("I will continue immediately.".into()),
+                ..TurnStopContext::default()
+            },
+        );
+        assert_eq!(plan.decision, ContinuationDecision::AllowStop);
+        assert_eq!(budget.used, 0);
+    }
+
+    #[test]
+    fn intent_continuation_matches_conservative_english_and_shares_budget() {
+        assert!(trailing_intent_to_continue(
+            "The tests passed.\nI will continue immediately."
+        ));
+        assert!(trailing_intent_to_continue("I'll continue immediately."));
+        assert!(!trailing_intent_to_continue("我将立即继续。"));
+        assert!(!trailing_intent_to_continue(
+            "\"I will continue immediately.\""
+        ));
+        assert!(!trailing_intent_to_continue(
+            "I will continue working on this tomorrow."
+        ));
+        let mut budget = AutoContinuationBudget::default();
+        assert_eq!(
+            commit_plan(&mut budget, &intent_stop("I will continue immediately.")),
+            ContinuationDecision::Continue { index: 1 }
+        );
+        assert_eq!(
+            commit_plan(&mut budget, &unfinished()),
+            ContinuationDecision::Continue { index: 2 }
+        );
+        assert_eq!(
+            commit_plan(&mut budget, &intent_stop("I'll continue now.")),
+            ContinuationDecision::StopBudgetExhausted
+        );
+        assert_eq!(budget.used, 2);
+    }
+
+    #[test]
+    fn intent_counts_only_after_stream_create_and_yields_to_cancel_and_steer() {
+        let mut budget = AutoContinuationBudget::default();
+        let plan = plan_turn_stop(&mut budget, &intent_stop("I will continue immediately."));
+        assert_eq!(plan.decision, ContinuationDecision::Continue { index: 1 });
+        assert_eq!(budget.used, 0);
+        release_continuation(&mut budget);
+        assert_eq!(budget.used, 0);
+        let again = plan_turn_stop(&mut budget, &intent_stop("I will continue immediately."));
+        commit_continuation(&mut budget, again.reservation.unwrap()).unwrap();
+        assert_eq!(budget.used, 1);
+
+        let cancelled = plan_turn_stop(
+            &mut budget,
+            &TurnStopContext {
+                cancelled: true,
+                intent_continuation_enabled: true,
+                natural_stop: true,
+                assistant_final_text: Some("I will continue immediately.".into()),
+                ..TurnStopContext::default()
+            },
+        );
+        assert_eq!(cancelled.decision, ContinuationDecision::StopCancelled);
+
+        let steered = plan_turn_stop(
+            &mut budget,
+            &TurnStopContext {
+                user_steer_pending: true,
+                intent_continuation_enabled: true,
+                natural_stop: true,
+                assistant_final_text: Some("I will continue immediately.".into()),
+                ..TurnStopContext::default()
+            },
+        );
+        assert_eq!(steered.decision, ContinuationDecision::StopUserSteer);
+        assert_eq!(budget.used, 0);
+    }
+
+    #[test]
+    fn subagent_wait_alone_does_not_continue_even_with_intent_flag() {
+        let mut budget = AutoContinuationBudget::default();
+        let plan = plan_turn_stop(
+            &mut budget,
+            &TurnStopContext {
+                unfinished: vec![UnfinishedSignal::NativeSubagentWorkRemaining],
+                intent_continuation_enabled: true,
+                natural_stop: true,
+                assistant_final_text: Some("waiting on the subagent".into()),
+                ..TurnStopContext::default()
+            },
+        );
+        assert_eq!(plan.decision, ContinuationDecision::AllowStop);
+    }
+
+    #[test]
+    fn reasoning_or_non_natural_stop_text_is_not_consulted() {
+        let mut budget = AutoContinuationBudget::default();
+        let tool_stop = plan_turn_stop(
+            &mut budget,
+            &TurnStopContext {
+                intent_continuation_enabled: true,
+                natural_stop: false,
+                assistant_final_text: Some("I will continue immediately.".into()),
+                ..TurnStopContext::default()
+            },
+        );
+        assert_eq!(tool_stop.decision, ContinuationDecision::AllowStop);
     }
 }

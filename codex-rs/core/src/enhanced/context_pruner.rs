@@ -1,9 +1,6 @@
-use serde::Deserialize;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
-use super::telemetry::EnhancedEvent;
-use super::telemetry::EnhancedEventFields;
-use super::telemetry::EnhancedEventKind;
+use super::telemetry::{EnhancedEvent, EnhancedEventFields, EnhancedEventKind};
 
 /// Shared experimental prune profile. V1 does not branch on model name.
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
@@ -191,10 +188,11 @@ pub fn apply_pressure_prune(
     // dropped and the item is measured directly from what is left.
     let mut rewritten_items = Vec::new();
     for (index, item) in next.items.iter_mut().enumerate() {
-        if let SurfaceItem::ToolResult { blocks, .. } = item
-            && prune_blocks(blocks, policy) > 0 {
+        if let SurfaceItem::ToolResult { blocks, .. } = item {
+            if prune_blocks(blocks, policy) > 0 {
                 rewritten_items.push(index);
             }
+        }
     }
     for index in rewritten_items {
         if let Some(slot) = next.item_token_estimates.get_mut(index) {
@@ -338,7 +336,7 @@ mod tests {
 
         let guessed = ModelVisibleSurface {
             item_token_estimates: Vec::new(),
-            ..surface
+            ..surface.clone()
         };
         assert!(
             guessed.estimated_tokens() < 1_700,
@@ -439,7 +437,7 @@ mod tests {
         let text = "犢皮紙".repeat(400); // 3 chars * 3 bytes * 400 = 3600 bytes
         let mut blocks = vec![ContentBlock {
             kind: "text".into(),
-            text: Some(text),
+            text: Some(text.clone()),
         }];
         let removed = prune_blocks(&mut blocks, ToolResultPrunePolicy::default());
         assert!(removed > 0, "3600 bytes is past the 2000-byte trigger");

@@ -7,9 +7,12 @@ use std::path::Path;
 
 use serde::Deserialize;
 
+use std::collections::HashSet;
+
 use super::bounded_continuation::ReservedContinuation;
 use super::config::AblationProfile;
 use super::config::EnhancedRuntimeFeatures;
+use super::config::FeatureFlagError;
 use super::context_projection::ContextProjectionStore;
 use super::context_pruner::ModelVisibleSurface;
 use super::hooks::EnhancedTurnHooks;
@@ -38,6 +41,7 @@ pub struct EnhancedSessionRuntime {
     pub pending_continuation: Option<ReservedContinuation>,
     pub ledger_restored: bool,
     pub context_projections: ContextProjectionStore,
+    pub pending_repetition_notices: HashSet<String>,
 }
 
 impl EnhancedSessionRuntime {
@@ -60,6 +64,7 @@ impl EnhancedSessionRuntime {
             pending_continuation: None,
             ledger_restored: false,
             context_projections: ContextProjectionStore::load(codex_home.as_ref(), thread_id),
+            pending_repetition_notices: HashSet::new(),
         }
     }
 
@@ -71,6 +76,7 @@ impl EnhancedSessionRuntime {
             pending_continuation: None,
             ledger_restored: false,
             context_projections: ContextProjectionStore::in_memory(),
+            pending_repetition_notices: HashSet::new(),
         }
     }
 }
@@ -81,10 +87,15 @@ pub fn load_features(codex_home: &Path) -> EnhancedRuntimeFeatures {
     {
         return parsed.features();
     }
-    if let Ok(profile) = std::env::var(FEATURE_PROFILE_ENV)
-        && let Some(features) = parse_feature_profile(&profile)
-    {
-        return features;
+    if let Ok(profile) = std::env::var(FEATURE_PROFILE_ENV) {
+        match parse_feature_profile(&profile) {
+            Ok(features) => return features,
+            Err(FeatureFlagError::Unknown(_)) => {
+                tracing::error!("unknown enhanced feature flag in {FEATURE_PROFILE_ENV}");
+                return EnhancedRuntimeFeatures::all_off();
+            }
+            Err(_) => {}
+        }
     }
     let path = codex_home.join(CONFIG_FILE);
     let Ok(bytes) = std::fs::read(&path) else {
@@ -122,8 +133,9 @@ fn profile_label(features: EnhancedRuntimeFeatures) -> &'static str {
     .unwrap_or("custom")
 }
 
-fn parse_feature_profile(value: &str) -> Option<EnhancedRuntimeFeatures> {
-    serde_json::from_str(value).ok()
+fn parse_feature_profile(value: &str) -> Result<EnhancedRuntimeFeatures, FeatureFlagError> {
+    let json = serde_json::from_str(value).map_err(|_| FeatureFlagError::NotObject)?;
+    EnhancedRuntimeFeatures::parse_strict(&json)
 }
 
 #[cfg(test)]
@@ -153,9 +165,21 @@ mod tests {
         let features = parse_feature_profile(
             r#"{"qwenToolReliability":true,"deepseekContextRecovery":false,"qwenBoundedContinuation":true}"#,
         )
-        .unwrap();
+        .expect("known flags");
         assert!(features.qwen_tool_reliability);
         assert!(!features.deepseek_context_recovery);
         assert!(features.qwen_bounded_continuation);
+        assert!(!features.repetition_notice);
+        assert!(!features.intent_continuation);
+    }
+
+    #[test]
+    fn unknown_feature_flags_are_not_silently_ignored() {
+        assert!(matches!(
+            parse_feature_profile(r#"{"qwenToolReliability":true,"mysteryFlag":true}"#),
+            Err(FeatureFlagError::Unknown(key)) if key == "mysteryFlag"
+        ));
+        assert!(!AblationProfile::E5.features().repetition_notice);
+        assert!(!AblationProfile::E5.features().intent_continuation);
     }
 }
