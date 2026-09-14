@@ -53,6 +53,10 @@ jobs:
         working-directory: codex-rs
         run: cargo build --release --locked --target ${{ matrix.target }} -p codex-cli
 
+      - name: Build Vellum Remote Control relay
+        working-directory: codex-rs
+        run: cargo build --release --locked --target ${{ matrix.target }} -p codex-app-server --bin vellum-codex-relay
+
       - name: Build Windows sandbox helpers
         if: runner.os == 'Windows'
         working-directory: codex-rs
@@ -82,7 +86,8 @@ jobs:
             "$release/codex.exe",
             "$release/codex-windows-sandbox-setup.exe",
             "$release/codex-command-runner.exe",
-            "$release/codex-code-mode-host.exe"
+            "$release/codex-code-mode-host.exe",
+            "$release/vellum-codex-relay.exe"
           ) -DestinationPath '${{ matrix.archive }}'
 
       - name: Package macOS artifact
@@ -90,7 +95,7 @@ jobs:
         run: |
           tar -czf '${{ matrix.archive }}' \
             -C 'codex-rs/target/${{ matrix.target }}/release' \
-            codex codex-code-mode-host
+            codex codex-code-mode-host vellum-codex-relay
 
       - name: Upload platform artifact
         uses: actions/upload-artifact@v4
