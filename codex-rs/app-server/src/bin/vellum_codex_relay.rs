@@ -109,8 +109,7 @@ async fn main() -> io::Result<()> {
 
     let mut status_rx = remote_control.status_receiver();
     let status_tx = output_tx.clone();
-    let initial_status = status_rx.borrow().clone();
-    send_output(&output_tx, json!({"kind":"status","status":initial_status})).await?;
+    status_rx.borrow_and_update();
     let status_task = tokio::spawn(async move {
         while status_rx.changed().await.is_ok() {
             let status = status_rx.borrow_and_update().clone();
