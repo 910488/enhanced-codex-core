@@ -20,7 +20,10 @@ jobs:
           - runner: windows-latest
             target: x86_64-pc-windows-msvc
             archive: enhanced-codex-core-x86_64-pc-windows-msvc.zip
-          - runner: macos-14
+          # rusty_v8's x86_64 static archive must be linked by an x86_64 host.
+          # Match the upstream Codex release workflow instead of cross-linking
+          # it on the arm64 macos-14 runner.
+          - runner: macos-15-xlarge
             target: x86_64-apple-darwin
             archive: enhanced-codex-core-x86_64-apple-darwin.tar.gz
           - runner: macos-14
