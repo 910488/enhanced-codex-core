@@ -16,6 +16,10 @@ path = "src/bin/notify_capture.rs"
 name = "exec-server"
 path = "src/bin/exec_server.rs"
 
+[[bin]]
+name = "vellum-codex-relay"
+path = "src/bin/vellum_codex_relay.rs"
+
 [lib]
 name = "codex_app_server"
 path = "src/lib.rs"
