@@ -39,6 +39,7 @@ const INVALID_REQUEST: i64 = -32600;
 const INVALID_PARAMS: i64 = -32602;
 const METHOD_NOT_FOUND: i64 = -32601;
 const INTERNAL_ERROR: i64 = -32603;
+const RELAY_APP_SERVER_CLIENT_NAME_ENV: &str = "VELLUM_RELAY_APP_SERVER_CLIENT_NAME";
 
 #[derive(Deserialize)]
 #[serde(tag = "kind", rename_all = "camelCase")]
@@ -63,6 +64,14 @@ async fn main() -> io::Result<()> {
     let installation_id = resolve_installation_id(&config.codex_home)
         .await
         .map_err(io::Error::other)?;
+    // The native stdio App Server keys persisted Remote Control enrollments by
+    // the initializing Desktop client's name. The relay runs outside that
+    // stdio connection, so its launcher supplies the same identity explicitly
+    // and the relay reuses the existing environment instead of creating a
+    // second, unpaired server that only differs by an empty client key.
+    let app_server_client_name = std::env::var(RELAY_APP_SERVER_CLIENT_NAME_ENV)
+        .ok()
+        .filter(|name| !name.trim().is_empty());
     let policy = if config
         .config_layer_stack
         .requirements()
@@ -91,7 +100,7 @@ async fn main() -> io::Result<()> {
     )
     .await?;
     let _persisted_enabled = remote_control
-        .resolve_persisted_preference(/*app_server_client_name*/ None)
+        .resolve_persisted_preference(app_server_client_name.as_deref())
         .await
         .unwrap_or(false);
 
@@ -144,7 +153,12 @@ async fn main() -> io::Result<()> {
                         }
                     }
                     RelayInput::Control { message } => {
-                        let response = handle_control(&remote_control, message).await;
+                        let response = handle_control(
+                            &remote_control,
+                            message,
+                            app_server_client_name.as_deref(),
+                        )
+                        .await;
                         send_output(&output_tx, json!({"kind":"control","message":response})).await?;
                     }
                 }
@@ -187,7 +201,11 @@ async fn send_output(output_tx: &mpsc::Sender<Value>, value: Value) -> io::Resul
         .map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "relay output closed"))
 }
 
-async fn handle_control(handle: &RemoteControlHandle, message: Value) -> Value {
+async fn handle_control(
+    handle: &RemoteControlHandle,
+    message: Value,
+    app_server_client_name: Option<&str>,
+) -> Value {
     let request = match serde_json::from_value::<JSONRPCMessage>(message) {
         Ok(JSONRPCMessage::Request(request)) => request,
         Ok(
@@ -204,7 +222,7 @@ async fn handle_control(handle: &RemoteControlHandle, message: Value) -> Value {
         }
     };
     let id = request.id.clone();
-    match handle_control_request(handle, request).await {
+    match handle_control_request(handle, request, app_server_client_name).await {
         Ok(result) => json!({"id":id,"result":result}),
         Err(error) => serde_json::to_value(JSONRPCError { id, error }).unwrap_or_else(
             |_| json!({"id":0,"error":{"code":INTERNAL_ERROR,"message":"serialization failed"}}),
@@ -215,6 +233,7 @@ async fn handle_control(handle: &RemoteControlHandle, message: Value) -> Value {
 async fn handle_control_request(
     handle: &RemoteControlHandle,
     request: JSONRPCRequest,
+    app_server_client_name: Option<&str>,
 ) -> Result<Value, JSONRPCErrorError> {
     let params = request.params.unwrap_or(Value::Null);
     match request.method.as_str() {
@@ -227,7 +246,7 @@ async fn handle_control_request(
                     .map_err(|error| map_io(error.to_string()))?
             } else {
                 handle
-                    .enable(/*app_server_client_name*/ None)
+                    .enable(app_server_client_name)
                     .await
                     .map_err(map_io)?
             };
@@ -240,7 +259,7 @@ async fn handle_control_request(
                 handle.disable_ephemeral().await
             } else {
                 handle
-                    .disable(/*app_server_client_name*/ None)
+                    .disable(app_server_client_name)
                     .await
                     .map_err(map_io)?
             };
@@ -259,7 +278,7 @@ async fn handle_control_request(
         "remoteControl/pairing/start" => {
             let params = parse_params::<RemoteControlPairingStartParams>(params)?;
             let response = handle
-                .start_pairing(params, /*app_server_client_name*/ None)
+                .start_pairing(params, app_server_client_name)
                 .await
                 .map_err(map_io)?;
             serde_json::to_value(response).map_err(map_serde)
