@@ -405,7 +405,10 @@ impl ToolRouter {
                 .enhanced
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
-            let result_text = result.as_ref().ok().map(|output| output.result.log_output());
+            let result_text = result
+                .as_ref()
+                .ok()
+                .map(|output| output.result.log_output());
             crate::enhanced::seams::complete_tool_call_with_result(
                 &mut runtime,
                 &ledger_call_id,

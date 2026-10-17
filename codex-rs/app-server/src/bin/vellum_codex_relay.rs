@@ -181,6 +181,9 @@ async fn main() -> io::Result<()> {
                             "message":message,
                         })).await?;
                     }
+                    // Only a managed daemon socket emits this; the relay owns no
+                    // daemon, so treat it like the transport going away.
+                    TransportEvent::DaemonShutdown => break,
                 }
             }
         }

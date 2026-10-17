@@ -380,7 +380,10 @@ async fn direct_results_keep_their_own_records_when_call_ids_repeat() {
     // Await in reverse order: each result must already own its record before history attachment.
     let mut outputs = Vec::new();
     for (arguments, future) in pending.into_iter().rev() {
-        let envelope = future.await.expect("plan result");
+        let envelope = future
+            .await
+            .expect("plan result")
+            .expect("plan call should produce a response");
         let item = &envelope.item;
         let ResponseItem::FunctionCallOutput {
             call_id: output_call_id,
@@ -438,7 +441,8 @@ async fn direct_results_keep_their_own_records_when_call_ids_repeat() {
     let result = pending
         .remove(0)
         .await
-        .expect("plan result after capture disabled");
+        .expect("plan result after capture disabled")
+        .expect("plan call should produce a response");
     assert!(result.item.executed_tool_call_metadata().is_none());
     session
         .services
@@ -460,7 +464,8 @@ async fn direct_results_keep_their_own_records_when_call_ids_repeat() {
         .pop()
         .expect("call prepared before disable")
         .await
-        .expect("plan result after capture re-enabled");
+        .expect("plan result after capture re-enabled")
+        .expect("plan call should produce a response");
     assert!(result.item.executed_tool_call_metadata().is_none());
 }
 

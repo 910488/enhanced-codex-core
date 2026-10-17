@@ -254,6 +254,7 @@ fn map_api_error_maps_context_length_exceeded_from_http_400_body() {
             url: Some("http://example.com/v1/responses".to_string()),
             headers: None,
             body: Some(body.to_string()),
+            retry_after: None,
         }));
         assert!(matches!(
             err.details(),

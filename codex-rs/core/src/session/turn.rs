@@ -1462,14 +1462,19 @@ async fn run_pre_sampling_compact(
             threshold,
         )
     };
+    let candidate = super::async_compaction::take_ready(sess, turn_context).await;
+    // Enhanced pressure handling may already have pruned the prompt below the
+    // limit; only defer to upstream (including a ready background compaction)
+    // when it has no opinion.
     let should_compact = match pressure {
-        crate::enhanced::seams::PressureSeam::DeferToUpstream => token_status.token_limit_reached,
+        crate::enhanced::seams::PressureSeam::DeferToUpstream => {
+            token_status.token_limit_reached || candidate.is_some()
+        }
         crate::enhanced::seams::PressureSeam::SkipNativeCompact => false,
         crate::enhanced::seams::PressureSeam::RunNativeCompact => true,
     };
-    let candidate = super::async_compaction::take_ready(sess, turn_context).await;
     // Compact if the configured auto-compaction budget or usable context window is exhausted.
-    if should_compact || candidate.is_some() {
+    if should_compact {
         // Pre-turn compaction runs before run_turn creates the normal sampling step.
         let step_context = sess
             .capture_step_context(Arc::clone(turn_context), cancellation_token)
@@ -1887,15 +1892,16 @@ async fn run_sampling_request(
             match run_auto_compact(
                 &sess,
                 Arc::clone(&step_context),
-                /*fallback_step_context*/ None,
+                Arc::clone(&step_context),
                 client_session,
-                InitialContextInjection::DoNotInject,
                 CompactionReason::ContextLimit,
                 CompactionPhase::MidTurn,
+                /*candidate*/ None,
             )
             .await
             {
-                Ok(()) => {
+                Ok(false) => {}
+                Ok(true) => {
                     {
                         let mut runtime = sess
                             .enhanced
@@ -1976,15 +1982,16 @@ async fn run_sampling_request(
                             match run_auto_compact(
                                 &sess,
                                 Arc::clone(&step_context),
-                                /*fallback_step_context*/ None,
+                                Arc::clone(&step_context),
                                 client_session,
-                                InitialContextInjection::DoNotInject,
                                 CompactionReason::ContextLimit,
                                 CompactionPhase::MidTurn,
+                                /*candidate*/ None,
                             )
                             .await
                             {
-                                Ok(()) => {
+                                Ok(false) => return Err(err),
+                                Ok(true) => {
                                     let mut runtime = sess
                                         .enhanced
                                         .lock()

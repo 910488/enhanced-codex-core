@@ -296,7 +296,7 @@ fn content_text(content: &[ContentItem]) -> String {
     content
         .iter()
         .filter_map(|item| match item {
-            ContentItem::InputText { text } | ContentItem::OutputText { text } => {
+            ContentItem::InputText { text } | ContentItem::OutputText { text, .. } => {
                 Some(text.as_str())
             }
             _ => None,
@@ -500,6 +500,8 @@ pub(crate) fn apply_repetition_notices(
         });
         if !already {
             items.push(ResponseItem::Message {
+                encrypted_content: None,
+                status: None,
                 id: None,
                 role: "user".into(),
                 content: vec![ContentItem::InputText {
@@ -870,7 +872,7 @@ pub(crate) async fn maybe_continue_turn(
                     .release_continuation();
                 return false;
             };
-            sess.record_response_item_and_emit_turn_item(turn_context, item)
+            sess.record_response_item_and_emit_turn_item(turn_context, turn_context.model_info(), item)
                 .await;
             sess.enhanced
                 .lock()
@@ -1002,6 +1004,8 @@ mod tests {
 
     fn call_item(call_id: &str, arguments: &str) -> ResponseItem {
         ResponseItem::FunctionCall {
+            encrypted_content: None,
+            status: None,
             id: None,
             name: "shell".into(),
             namespace: None,
@@ -1025,6 +1029,8 @@ mod tests {
 
     fn plan_call_item(call_id: &str, status: &str) -> ResponseItem {
         ResponseItem::FunctionCall {
+            encrypted_content: None,
+            status: None,
             id: None,
             name: "update_plan".into(),
             namespace: None,
@@ -1196,6 +1202,8 @@ mod tests {
         for follow_up in 0..3 {
             let mut prompt = original.clone();
             prompt.push(ResponseItem::Message {
+                encrypted_content: None,
+                status: None,
                 id: None,
                 role: "user".into(),
                 content: vec![ContentItem::InputText {
