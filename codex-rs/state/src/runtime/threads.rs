@@ -16,6 +16,9 @@ SELECT
     threads.updated_at_ms AS updated_at,
     threads.recency_at_ms AS recency_at,
     threads.source,
+    threads.originator,
+    threads.creator_user_id,
+    threads.creator_account_id,
     threads.history_mode,
     threads.thread_source,
     threads.agent_nickname,
@@ -48,6 +51,7 @@ SELECT
     threads.section_position,
     threads.section_entered_at_ms,
     threads.project_id,
+    threads.daybreak_enabled,
     threads.git_sha,
     threads.git_branch,
     threads.git_origin_url
@@ -70,7 +74,7 @@ WHERE threads.id = ?
     ) -> anyhow::Result<bool> {
         // Legacy threads display `title`, then fall back to the name index. Paginated threads
         // display `name`; `title` remains derived metadata used for search. Preserve an existing
-        // `name`, otherwise carry over the legacy display name.
+        // `name`, unless it is the Guardian default seeded by metadata cleanup.
         let result = sqlx::query(
             r#"
 UPDATE threads
@@ -78,11 +82,16 @@ SET
     history_mode = 'paginated',
     name = CASE
         WHEN name IS NULL OR trim(name) = '' THEN ?
+        WHEN history_mode = 'legacy'
+            AND source = '{"subagent":{"other":"guardian"}}'
+            AND name = ? THEN COALESCE(?, name)
         ELSE name
     END
 WHERE id = ?
             "#,
         )
+        .bind(legacy_name)
+        .bind(crate::GUARDIAN_THREAD_TITLE)
         .bind(legacy_name)
         .bind(thread_id.to_string())
         .execute(self.pool.as_ref())
@@ -569,7 +578,9 @@ ON CONFLICT(child_thread_id) DO NOTHING
             },
             matches!(
                 sort_key,
-                crate::SortKey::RecencyAt | crate::SortKey::SectionPosition
+                crate::SortKey::CreatedAt
+                    | crate::SortKey::RecencyAt
+                    | crate::SortKey::SectionPosition
             ),
         );
         push_thread_order_and_limit(
@@ -579,7 +590,9 @@ ON CONFLICT(child_thread_id) DO NOTHING
             OrderByIndex::Enabled,
             matches!(
                 sort_key,
-                crate::SortKey::RecencyAt | crate::SortKey::SectionPosition
+                crate::SortKey::CreatedAt
+                    | crate::SortKey::RecencyAt
+                    | crate::SortKey::SectionPosition
             ),
             limit,
         );
@@ -618,6 +631,9 @@ INSERT INTO threads (
     updated_at_ms,
     recency_at_ms,
     source,
+    originator,
+    creator_user_id,
+    creator_account_id,
     history_mode,
     thread_source,
     agent_nickname,
@@ -644,8 +660,9 @@ INSERT INTO threads (
     git_branch,
     git_origin_url,
     memory_mode,
-    project_id
-) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    project_id,
+    daybreak_enabled
+) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 ON CONFLICT(id) DO NOTHING
             "#,
         )
@@ -658,6 +675,9 @@ ON CONFLICT(id) DO NOTHING
         .bind(datetime_to_epoch_millis(updated_at))
         .bind(datetime_to_epoch_millis(recency_at))
         .bind(metadata.source.as_str())
+        .bind(metadata.originator.as_deref())
+        .bind(metadata.creator_user_id.as_deref())
+        .bind(metadata.creator_account_id.as_deref())
         .bind(metadata.history_mode.as_str())
         .bind(
             metadata
@@ -695,9 +715,24 @@ ON CONFLICT(id) DO NOTHING
         .bind(metadata.git_origin_url.as_deref())
         .bind("enabled")
         .bind(metadata.project_id.as_deref())
+        .bind(metadata.daybreak_enabled)
         .execute(self.pool.as_ref())
         .await?;
         self.insert_thread_spawn_edge_from_source_if_absent(metadata.id, metadata.source.as_str())
+            .await?;
+        Ok(result.rows_affected() > 0)
+    }
+
+    /// Set the user preference without changing rollout-derived thread metadata.
+    pub async fn set_thread_daybreak_enabled(
+        &self,
+        thread_id: ThreadId,
+        daybreak_enabled: bool,
+    ) -> anyhow::Result<bool> {
+        let result = sqlx::query("UPDATE threads SET daybreak_enabled = ? WHERE id = ?")
+            .bind(daybreak_enabled)
+            .bind(thread_id.to_string())
+            .execute(self.pool.as_ref())
             .await?;
         Ok(result.rows_affected() > 0)
     }
@@ -883,6 +918,7 @@ WHERE id = ?
         // Backfill/reconcile callers merge existing git info before upserting, but that
         // read/modify/write is not atomic. Preserve non-null SQLite git fields here so
         // an explicit metadata update cannot be lost if a stale rollout upsert lands later.
+        // Daybreak and project choices are insert-only here; explicit changes use their setters.
         sqlx::query(
             r#"
 INSERT INTO threads (
@@ -895,6 +931,9 @@ INSERT INTO threads (
     updated_at_ms,
     recency_at_ms,
     source,
+    originator,
+    creator_user_id,
+    creator_account_id,
     history_mode,
     thread_source,
     agent_nickname,
@@ -921,8 +960,9 @@ INSERT INTO threads (
     git_branch,
     git_origin_url,
     memory_mode,
-    project_id
-) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    project_id,
+    daybreak_enabled
+) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 ON CONFLICT(id) DO UPDATE SET
     rollout_path = excluded.rollout_path,
     created_at = excluded.created_at,
@@ -932,6 +972,9 @@ ON CONFLICT(id) DO UPDATE SET
     updated_at_ms = excluded.updated_at_ms,
     recency_at_ms = threads.recency_at_ms,
     source = excluded.source,
+    originator = COALESCE(threads.originator, excluded.originator),
+    creator_user_id = COALESCE(threads.creator_user_id, excluded.creator_user_id),
+    creator_account_id = COALESCE(threads.creator_account_id, excluded.creator_account_id),
     -- Paginated history is a one-way promotion; stale legacy metadata must not downgrade it.
     history_mode = CASE
         WHEN threads.history_mode = 'paginated' THEN threads.history_mode
@@ -968,6 +1011,9 @@ ON CONFLICT(id) DO UPDATE SET
         .bind(datetime_to_epoch_millis(updated_at))
         .bind(datetime_to_epoch_millis(insert_recency_at))
         .bind(metadata.source.as_str())
+        .bind(metadata.originator.as_deref())
+        .bind(metadata.creator_user_id.as_deref())
+        .bind(metadata.creator_account_id.as_deref())
         .bind(metadata.history_mode.as_str())
         .bind(
             metadata
@@ -1005,6 +1051,7 @@ ON CONFLICT(id) DO UPDATE SET
         .bind(metadata.git_origin_url.as_deref())
         .bind(creation_memory_mode.unwrap_or("enabled"))
         .bind(metadata.project_id.as_deref())
+        .bind(metadata.daybreak_enabled)
         .execute(self.pool.as_ref())
         .await?;
         self.insert_thread_spawn_edge_from_source_if_absent(metadata.id, metadata.source.as_str())
@@ -1129,7 +1176,7 @@ ON CONFLICT(id) DO UPDATE SET
                 .execute(self.logs_pool.as_ref())
                 .await?;
             self.thread_queue.delete_thread_queue(*thread_id).await?;
-            self.memories.delete_thread_memory(*thread_id).await?;
+            self.delete_versioned_thread_memory(*thread_id).await?;
             self.thread_goals.delete_thread_goal(*thread_id).await?;
         }
 
@@ -1151,6 +1198,10 @@ ON CONFLICT(id) DO UPDATE SET
         }
         let mut rows_affected = 0;
         for thread_id_string in &thread_id_strings {
+            sqlx::query("DELETE FROM thread_read_receipts WHERE thread_id = ?")
+                .bind(thread_id_string)
+                .execute(&mut *tx)
+                .await?;
             rows_affected += sqlx::query("DELETE FROM threads WHERE id = ?")
                 .bind(thread_id_string)
                 .execute(&mut *tx)
@@ -1224,7 +1275,7 @@ WITH RECURSIVE subtree(child_thread_id, parent_thread_id) AS (
     let include_thread_id_tiebreaker = relation_filter.is_some()
         || matches!(
             filters.sort_key,
-            SortKey::RecencyAt | SortKey::SectionPosition
+            SortKey::CreatedAt | SortKey::RecencyAt | SortKey::SectionPosition
         );
     push_thread_filters_with_preview(
         builder,
@@ -1273,6 +1324,9 @@ SELECT
     threads.updated_at_ms AS updated_at,
     threads.recency_at_ms AS recency_at,
     threads.source,
+    threads.originator,
+    threads.creator_user_id,
+    threads.creator_account_id,
     threads.history_mode,
     threads.thread_source,
     threads.agent_nickname,
@@ -1305,6 +1359,7 @@ SELECT
     threads.section_position,
     threads.section_entered_at_ms,
     threads.project_id,
+    threads.daybreak_enabled,
     threads.git_sha,
     threads.git_branch,
     threads.git_origin_url
@@ -1322,6 +1377,7 @@ pub(super) fn extract_memory_mode(items: &[RolloutItem]) -> Option<String> {
         | RolloutItem::TurnContext(_)
         | RolloutItem::WorldState(_)
         | RolloutItem::RealtimeItem(_)
+        | RolloutItem::RetainedContext(_)
         | RolloutItem::SecurityRiskScore(_)
         | RolloutItem::TokenUsageRecord(_)
         | RolloutItem::EventMsg(_) => None,
@@ -1385,7 +1441,7 @@ fn push_thread_filters_with_preview<'a>(
     } else {
         builder.push(" AND threads.archived = 0");
     }
-    if !include_empty_preview && !matches!(section, Some(Some(_))) {
+    if !archived_only && !include_empty_preview && !matches!(section, Some(Some(_))) {
         builder.push(" AND threads.preview <> ''");
     }
     match section {
@@ -1461,6 +1517,11 @@ fn push_thread_filters_with_preview<'a>(
             SortDirection::Asc => ">",
             SortDirection::Desc => "<",
         };
+        if include_thread_id_tiebreaker && anchor.id.is_some() {
+            // Keep the timestamp index range despite the UUID tie-breaker's OR predicate.
+            builder.push(format!(" AND {column} {operator}= "));
+            builder.push_bind(anchor_ts);
+        }
         builder.push(" AND (");
         builder.push(column);
         builder.push(" ");
@@ -1643,6 +1704,62 @@ mod tests {
                 .history_mode,
             ThreadHistoryMode::Paginated
         );
+    }
+
+    #[tokio::test]
+    async fn archived_threads_without_previews_remain_listed() {
+        let codex_home = unique_temp_dir();
+        let runtime = StateRuntime::init(
+            crate::SqliteConfig::new_for_testing(codex_home.as_path().abs()),
+            "test-provider".to_string(),
+        )
+        .await
+        .unwrap();
+        let thread_id = ThreadId::from_string("00000000-0000-0000-0000-000000000045").unwrap();
+        let mut metadata = test_thread_metadata(&codex_home, thread_id, codex_home.clone());
+        metadata.preview = Some(String::new());
+        metadata.first_user_message = None;
+        runtime.upsert_thread(&metadata).await.unwrap();
+        let filters = |archived_only| ThreadFilterOptions {
+            archived_only,
+            allowed_sources: &[],
+            model_providers: None,
+            cwd_filters: None,
+            section: None,
+            project_id: None,
+            anchor: None,
+            sort_key: SortKey::CreatedAt,
+            sort_direction: SortDirection::Desc,
+            search_term: None,
+        };
+        let active = runtime
+            .list_threads(/*page_size*/ 10, filters(/*archived_only*/ false))
+            .await
+            .unwrap();
+        assert!(active.items.is_empty());
+
+        runtime
+            .mark_archived(thread_id, &metadata.rollout_path, Utc::now())
+            .await
+            .unwrap();
+        let archived = runtime
+            .list_threads(/*page_size*/ 10, filters(/*archived_only*/ true))
+            .await
+            .unwrap();
+        assert_eq!(
+            archived
+                .items
+                .iter()
+                .map(|thread| thread.id)
+                .collect::<Vec<_>>(),
+            vec![thread_id]
+        );
+        assert_eq!(archived.next_anchor, None);
+        let active = runtime
+            .list_threads(/*page_size*/ 10, filters(/*archived_only*/ false))
+            .await
+            .unwrap();
+        assert!(active.items.is_empty());
     }
 
     #[tokio::test]
@@ -2146,6 +2263,8 @@ mod tests {
             (other_id, other_cwd, 1_700_000_500),
         ] {
             let mut metadata = test_thread_metadata(&codex_home, thread_id, cwd);
+            metadata.created_at =
+                DateTime::<Utc>::from_timestamp(1_700_000_300, 0).expect("valid timestamp");
             metadata.updated_at =
                 DateTime::<Utc>::from_timestamp(updated_at, 0).expect("valid timestamp");
             runtime
@@ -2236,6 +2355,43 @@ mod tests {
             .expect("list with empty cwd filters should succeed");
 
         assert_eq!(page.items, Vec::new());
+
+        let anchor = Anchor {
+            ts: DateTime::<Utc>::from_timestamp(1_700_000_300, 0).expect("valid timestamp"),
+            id: Some(second_id),
+        };
+        // Activity must not move the unread thread ahead of the creation cursor.
+        runtime
+            .touch_thread_updated_at(first_id, Utc::now())
+            .await
+            .unwrap();
+        runtime
+            .touch_thread_recency_at(first_id, Utc::now())
+            .await
+            .unwrap();
+        let page = runtime
+            .list_threads(
+                /*page_size*/ 1,
+                ThreadFilterOptions {
+                    archived_only: false,
+                    allowed_sources: &[],
+                    model_providers: None,
+                    cwd_filters: Some(cwd_filters.as_slice()),
+                    section: None,
+                    project_id: None,
+                    anchor: Some(&anchor),
+                    sort_key: SortKey::CreatedAt,
+                    sort_direction: SortDirection::Desc,
+                    search_term: None,
+                },
+            )
+            .await
+            .expect("creation-time continuation should succeed");
+        assert_eq!(
+            page.items.iter().map(|item| item.id).collect::<Vec<_>>(),
+            vec![first_id]
+        );
+        assert_eq!(page.next_anchor, None);
     }
 
     #[tokio::test]
@@ -2255,7 +2411,7 @@ mod tests {
         ];
         let anchor = Anchor {
             ts: DateTime::<Utc>::from_timestamp(1_700_000_000, 0).expect("valid timestamp"),
-            id: None,
+            id: Some(ThreadId::new()),
         };
         for (sort_key, visible_index, cwd_index) in [
             (
@@ -2276,6 +2432,7 @@ mod tests {
         ] {
             for (cwd_filters, anchor, expected_index, expect_temp_sort) in [
                 (None, None, visible_index, false),
+                (None, Some(&anchor), visible_index, false),
                 (Some(&cwd_filters[..1]), None, cwd_index, false),
                 (
                     Some(&cwd_filters[..]),
@@ -2318,13 +2475,96 @@ mod tests {
                         .any(|detail| detail.contains(expected_index)),
                     "query plan did not use {expected_index}: {plan_details:?}"
                 );
+                if anchor.is_some() && cwd_filters.is_none() {
+                    let timestamp_column = match sort_key {
+                        SortKey::CreatedAt => "created_at_ms",
+                        SortKey::UpdatedAt => "updated_at_ms",
+                        SortKey::RecencyAt => "recency_at_ms",
+                        SortKey::SectionPosition => unreachable!(),
+                    };
+                    assert!(
+                        plan_details
+                            .iter()
+                            .any(|detail| { detail.contains(&format!("{timestamp_column}<?")) }),
+                        "cursor query lost its timestamp index range: {plan_details:?}"
+                    );
+                }
+                // The visible creation-time index covers timestamps, so only ties need sorting.
+                let expect_tie_sort = sort_key == SortKey::CreatedAt && cwd_filters.is_none();
+                if expect_tie_sort {
+                    assert!(
+                        plan_details.iter().any(|detail| {
+                            detail.contains("TEMP B-TREE FOR LAST TERM OF ORDER BY")
+                        }),
+                        "unexpected tie sorting plan: {plan_details:?}"
+                    );
+                }
                 assert_eq!(
                     plan_details
                         .iter()
                         .any(|detail| detail.contains("TEMP B-TREE")),
-                    expect_temp_sort,
+                    expect_temp_sort || expect_tie_sort,
                     "unexpected sorting plan: {plan_details:?}"
                 );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn archived_thread_pages_use_ordered_indexes_without_sorting() {
+        let codex_home = unique_temp_dir();
+        let runtime = StateRuntime::init(
+            crate::SqliteConfig::new_for_testing(codex_home.as_path().abs()),
+            "test-provider".to_string(),
+        )
+        .await
+        .expect("state db should initialize");
+        let anchor = Anchor {
+            ts: DateTime::<Utc>::from_timestamp(1_700_000_000, 0).expect("valid timestamp"),
+            id: Some(ThreadId::new()),
+        };
+        for (sort_key, expected_index) in [
+            (SortKey::CreatedAt, "idx_threads_archive_created_at_ms"),
+            (SortKey::UpdatedAt, "idx_threads_archive_updated_at_ms"),
+            (SortKey::RecencyAt, "idx_threads_archive_recency_at_ms"),
+        ] {
+            for sort_direction in [SortDirection::Asc, SortDirection::Desc] {
+                for anchor in [None, Some(&anchor)] {
+                    let mut builder = QueryBuilder::<Sqlite>::new("EXPLAIN QUERY PLAN ");
+                    push_list_threads_query(
+                        &mut builder,
+                        ThreadFilterOptions {
+                            archived_only: true,
+                            allowed_sources: &[],
+                            model_providers: None,
+                            cwd_filters: None,
+                            section: None,
+                            project_id: None,
+                            anchor,
+                            sort_key,
+                            sort_direction,
+                            search_term: None,
+                        },
+                        /*relation_filter*/ None,
+                        /*limit*/ 2,
+                    );
+                    let details = builder
+                        .build()
+                        .fetch_all(runtime.pool.as_ref())
+                        .await
+                        .expect("load archive query plan")
+                        .into_iter()
+                        .map(|row| row.get::<String, _>("detail"))
+                        .collect::<Vec<_>>();
+                    assert!(
+                        details.iter().any(|detail| detail.contains(expected_index)),
+                        "archive page did not use {expected_index}: {details:?}"
+                    );
+                    assert!(
+                        !details.iter().any(|detail| detail.contains("TEMP B-TREE")),
+                        "archive page needed a temporary sort: {details:?}"
+                    );
+                }
             }
         }
     }
@@ -2566,6 +2806,8 @@ mod tests {
         );
         let items = vec![RolloutItem::SessionMeta(SessionMetaLine {
             meta: SessionMeta {
+                creator_user_id: None,
+                creator_account_id: None,
                 session_id: thread_id.into(),
                 id: thread_id,
                 forked_from_id: None,
@@ -2573,6 +2815,7 @@ mod tests {
                 parent_thread_id: None,
                 timestamp: metadata.created_at.to_rfc3339(),
                 cwd: PathBuf::new(),
+                runtime_workspace_roots: None,
                 originator: String::new(),
                 cli_version: String::new(),
                 source: SessionSource::Cli,
@@ -2637,6 +2880,8 @@ mod tests {
         );
         let items = vec![RolloutItem::SessionMeta(SessionMetaLine {
             meta: SessionMeta {
+                creator_user_id: None,
+                creator_account_id: None,
                 session_id: thread_id.into(),
                 id: thread_id,
                 forked_from_id: None,
@@ -2644,6 +2889,7 @@ mod tests {
                 parent_thread_id: None,
                 timestamp: created_at,
                 cwd: PathBuf::new(),
+                runtime_workspace_roots: None,
                 originator: String::new(),
                 cli_version: String::new(),
                 source: SessionSource::Cli,
@@ -2694,7 +2940,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn upsert_thread_preserves_existing_git_fields_atomically() {
+    async fn upsert_thread_preserves_existing_git_and_originator_atomically() {
         let codex_home = unique_temp_dir();
         let runtime = StateRuntime::init(
             crate::SqliteConfig::new_for_testing(codex_home.as_path().abs()),
@@ -2718,6 +2964,9 @@ mod tests {
             .expect("initial upsert should succeed");
 
         let mut rollout_metadata = metadata.clone();
+        rollout_metadata.originator = Some("recorded_client".to_string());
+        rollout_metadata.creator_user_id = Some("creator-user".to_string());
+        rollout_metadata.creator_account_id = Some("creator-account".to_string());
         rollout_metadata.git_sha = Some("rollout-sha".to_string());
         rollout_metadata.git_branch = Some("rollout-branch".to_string());
         rollout_metadata.git_origin_url = Some(
@@ -2735,12 +2984,36 @@ mod tests {
             .await
             .expect("thread should load")
             .expect("thread should exist");
+        assert_eq!(persisted.originator.as_deref(), Some("recorded_client"));
         assert_eq!(persisted.git_sha.as_deref(), Some("sqlite-sha"));
         assert_eq!(persisted.git_branch.as_deref(), Some("sqlite-branch"));
         assert_eq!(
             persisted.git_origin_url.as_deref(),
             Some("git@example.com:openai/codex.git")
         );
+
+        for incoming_originator in [None, Some("resume_client")] {
+            rollout_metadata.originator = incoming_originator.map(str::to_owned);
+            rollout_metadata.creator_user_id = incoming_originator.map(str::to_owned);
+            rollout_metadata.creator_account_id = incoming_originator.map(str::to_owned);
+            runtime
+                .upsert_thread(&rollout_metadata)
+                .await
+                .expect("later upsert should succeed");
+            let persisted = runtime
+                .get_thread(thread_id)
+                .await
+                .expect("thread should load")
+                .expect("thread should exist");
+            assert_eq!(persisted.originator.as_deref(), Some("recorded_client"));
+            assert_eq!(
+                (
+                    persisted.creator_user_id.as_deref(),
+                    persisted.creator_account_id.as_deref()
+                ),
+                (Some("creator-user"), Some("creator-account")),
+            );
+        }
     }
 
     #[tokio::test]

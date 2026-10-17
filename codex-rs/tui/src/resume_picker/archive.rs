@@ -36,8 +36,8 @@ impl PickerState {
         }
 
         let archive_key = KeyEvent::new(KeyCode::Char('a'), KeyModifiers::CONTROL);
-        self.list_keymap.action_for(archive_key).is_none()
-            && !self.chord_keymap.bindings.iter().any(|binding| {
+        self.keymap.list.action_for(archive_key).is_none()
+            && !self.keymap.chords.bindings.iter().any(|binding| {
                 binding.action.context == KeymapContext::List
                     && binding.chord.prefix.is_press(archive_key)
             })
@@ -83,6 +83,7 @@ impl PickerState {
         if self.archive_state != (ArchiveState::Pending { thread_id }) {
             return;
         }
+        self.chord_matcher.cancel();
         self.archive_state = ArchiveState::Idle;
 
         if let Err(error) = result {
@@ -154,6 +155,7 @@ impl PickerState {
         if self.archive_state != (ArchiveState::Restoring { thread_id }) {
             return None;
         }
+        self.chord_matcher.cancel();
         self.archive_state = ArchiveState::Idle;
 
         match result {

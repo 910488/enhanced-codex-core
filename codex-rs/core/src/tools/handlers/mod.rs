@@ -24,6 +24,7 @@ pub(crate) mod request_plugin_install_spec;
 mod request_user_input;
 mod request_user_input_async;
 pub(crate) mod request_user_input_spec;
+mod send_message_to_user_async;
 pub(crate) mod shell_spec;
 mod sleep;
 mod test_sync;
@@ -35,6 +36,7 @@ mod view_image;
 pub(crate) mod view_image_spec;
 mod wait_for_environment;
 
+use codex_features::Feature;
 use codex_file_system::FileSystemSandboxContext;
 use codex_sandboxing::policy_transforms::materialize_additional_permissions_with_context;
 use codex_sandboxing::policy_transforms::merge_permission_profiles;
@@ -46,10 +48,9 @@ use serde::Deserialize;
 use serde_json::Map;
 use serde_json::Value;
 
-use crate::environment_selection::TurnEnvironmentSnapshot;
 use crate::function_tool::FunctionCallError;
 use crate::sandboxing::SandboxPermissions;
-use crate::session::session::Session;
+use crate::session::step_context::StepContext;
 use crate::session::turn_context::TurnEnvironment;
 pub(crate) use crate::tools::code_mode::CodeModeExecuteHandler;
 pub(crate) use crate::tools::code_mode::CodeModeWaitHandler;
@@ -66,10 +67,12 @@ pub use mcp_resource::ListMcpResourcesHandler;
 pub use mcp_resource::ReadMcpResourceHandler;
 pub use new_context_window::NewContextWindowHandler;
 pub use plan::PlanHandler;
+pub(crate) use request_permissions::RequestPermissionsEnvironmentArgs;
 pub use request_permissions::RequestPermissionsHandler;
 pub use request_plugin_install::RequestPluginInstallHandler;
 pub use request_user_input::RequestUserInputHandler;
 pub use request_user_input_async::RequestUserInputAsyncHandler;
+pub use send_message_to_user_async::SendMessageToUserAsyncHandler;
 pub use sleep::SleepHandler;
 pub use test_sync::TestSyncHandler;
 pub(crate) use tool_search::ToolSearchHandlerCache;
@@ -155,23 +158,42 @@ where
 }
 
 fn resolve_tool_environment<'a>(
-    environments: &'a TurnEnvironmentSnapshot,
+    step_context: &'a StepContext,
     environment_id: Option<&str>,
-) -> Result<Option<&'a TurnEnvironment>, FunctionCallError> {
+    legacy_unavailable_message: &'static str,
+) -> Result<&'a TurnEnvironment, FunctionCallError> {
+    let environments = &step_context.environments;
+    let stable_environment_tools = step_context
+        .turn
+        .config
+        .features
+        .get()
+        .enabled(Feature::StableEnvironmentTools);
     environment_id.map_or_else(
-        || Ok(environments.primary()),
+        || environments.primary(),
         |environment_id| {
             environments
                 .turn_environments()
                 .find(|environment| environment.selection.environment_id == environment_id)
-                .map(Some)
-                .ok_or_else(|| {
-                    FunctionCallError::RespondToModel(format!(
-                        "unknown turn environment id `{environment_id}`"
-                    ))
-                })
         },
-    )
+    ).ok_or_else(|| {
+        if let Some(environment_id) = environment_id
+            && (!stable_environment_tools
+                || !environments
+                    .all_selections()
+                    .iter()
+                    .any(|selection| selection.environment_id == environment_id))
+        {
+            return FunctionCallError::RespondToModel(format!(
+                "unknown turn environment id `{environment_id}`"
+            ));
+        }
+        FunctionCallError::RespondToModel(if stable_environment_tools {
+            "No usable execution environment is available. Wait for an environment to become available before using this tool.".to_string()
+        } else {
+            legacy_unavailable_message.to_string()
+        })
+    })
 }
 
 /// Validates feature/policy constraints for `with_additional_permissions` and
@@ -241,10 +263,10 @@ pub(super) struct EffectiveAdditionalPermissions {
 pub(super) fn file_system_sandbox_policy_context_for_cwd<'a>(
     sandbox_context: &'a FileSystemSandboxContext,
     cwd: &'a PathUri,
-) -> Option<codex_protocol::permissions::FileSystemSandboxPolicyContext<'a>> {
-    let mut context = sandbox_context.policy_context()?;
+) -> codex_protocol::permissions::FileSystemSandboxPolicyContext<'a> {
+    let mut context = sandbox_context.policy_context();
     context.cwd = cwd;
-    Some(context)
+    context
 }
 
 pub(super) fn implicit_granted_permissions(
@@ -264,8 +286,8 @@ pub(super) fn implicit_granted_permissions(
     }
 }
 
-pub(super) async fn apply_granted_turn_permissions(
-    session: &Session,
+pub(super) fn apply_granted_turn_permissions(
+    step_context: &StepContext,
     environment: &TurnEnvironment,
     cwd: &PathUri,
     sandbox_permissions: SandboxPermissions,
@@ -280,12 +302,7 @@ pub(super) async fn apply_granted_turn_permissions(
     }
 
     let environment_id = &environment.selection.environment_id;
-    let granted_session_permissions = session.granted_session_permissions(environment_id).await;
-    let granted_turn_permissions = session.granted_turn_permissions(environment_id).await;
-    let granted_permissions = merge_permission_profiles(
-        granted_session_permissions.as_ref(),
-        granted_turn_permissions.as_ref(),
-    );
+    let granted_permissions = step_context.turn.granted_permissions(environment_id);
     let effective_permissions = merge_permission_profiles(
         additional_permissions.as_ref(),
         granted_permissions.as_ref(),
@@ -296,9 +313,9 @@ pub(super) async fn apply_granted_turn_permissions(
         if additional_permissions.is_none() {
             Some(granted.clone())
         } else {
-            effective_permissions.as_ref().and_then(|effective| {
-                preapproved_permission_profile(effective, granted, context.as_ref()?)
-            })
+            effective_permissions
+                .as_ref()
+                .and_then(|effective| preapproved_permission_profile(effective, granted, &context))
         }
     });
     let permissions_preapproved = preapproved_permissions.is_some();
@@ -394,7 +411,7 @@ mod tests {
     use codex_protocol::permissions::FileSystemSpecialPath;
     use codex_protocol::protocol::AskForApproval;
     use codex_protocol::protocol::GranularApprovalConfig;
-    use codex_sandboxing::policy_transforms::intersect_permission_profiles;
+    use codex_sandboxing::policy_transforms::intersect_permission_profiles_with_context;
     use codex_sandboxing::policy_transforms::merge_permission_profiles;
     use codex_utils_absolute_path::AbsolutePathBuf;
     use codex_utils_path_uri::PathUri;
@@ -536,21 +553,21 @@ mod tests {
             }),
             ..Default::default()
         };
-        let stored_grant = intersect_permission_profiles(
+        let cwd_uri = PathUri::from_host_native_path(cwd.path()).expect("cwd URI");
+        let stored_grant = intersect_permission_profiles_with_context(
             requested_permissions.clone(),
             requested_permissions.clone(),
-            cwd.path(),
+            &local_context(&cwd_uri),
         );
         let effective_permissions =
             merge_permission_profiles(Some(&requested_permissions), Some(&stored_grant))
                 .expect("merged permissions");
-        let cwd = PathUri::from_host_native_path(cwd.path()).expect("cwd URI");
 
         assert_eq!(
             preapproved_permission_profile(
                 &effective_permissions,
                 &stored_grant,
-                &local_context(&cwd),
+                &local_context(&cwd_uri),
             ),
             Some(stored_grant)
         );

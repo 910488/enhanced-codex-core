@@ -3,7 +3,6 @@ use codex_core::StartThreadOptions;
 use codex_core::SuspendTurnOutcome;
 use codex_core::TurnInputRequest;
 use codex_history::RolloutItem;
-use codex_history::RolloutLine;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -112,7 +111,7 @@ async fn root_turn_suspension_preserves_unfinished_turn_history() {
         }]))
         .await
         .expect("start root turn");
-    let codex_core::TurnInputSubmission::Started { turn_id } = submitted else {
+    let codex_core::TurnInputSubmission::Started { turn_id, .. } = submitted else {
         panic!("expected a started root turn");
     };
     wait_for_event(&codex, |event| matches!(event, EventMsg::TurnStarted(_))).await;
@@ -152,7 +151,7 @@ async fn root_turn_suspension_preserves_unfinished_turn_history() {
     let items = rollout
         .lines()
         .map(|line| {
-            serde_json::from_str::<RolloutLine>(line)
+            codex_rollout::parse_rollout_line(line)
                 .expect("parse durable rollout")
                 .item
         })
@@ -192,7 +191,8 @@ async fn root_turn_suspension_preserves_unfinished_turn_history() {
             .await
             .expect("recover the unfinished turn"),
         codex_core::StartIfIdleSubmission::Started {
-            turn_id: turn_id.clone(),
+            root_turn_id: turn_id.clone(),
+            turn_id: turn_id.clone()
         },
     );
     let completed = wait_for_event(&resumed.codex, |event| {

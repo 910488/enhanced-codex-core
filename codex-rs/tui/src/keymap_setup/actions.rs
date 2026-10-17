@@ -86,6 +86,10 @@ impl KeymapActionDescriptor {
 pub(super) const KEYMAP_ACTIONS: &[KeymapActionDescriptor] = &[
     action("global", "Global", "open_agents", "Open the shared agent-session overview."),
     action("global", "Global", "open_transcript", "Open the transcript overlay."),
+    action("global", "Global", "find_transcript", "Find text in the full transcript."),
+    // Keep the new warnings action out of shared-config writes until older strict readers
+    // accept it. Its built-in shortcuts remain available.
+    action("global", "Global", "focus_activity", "Focus transcript activity groups to expand or collapse their details."),
     action("global", "Global", "open_external_editor", "Open the current draft in an external editor."),
     action("global", "Global", "copy", "Copy the last agent response to the clipboard."),
     action("global", "Global", "clear_terminal", "Clear the terminal UI."),
@@ -93,12 +97,17 @@ pub(super) const KEYMAP_ACTIONS: &[KeymapActionDescriptor] = &[
     gated_action("global", "Global", "toggle_fast_mode", "Turn Fast mode on or off.", KeymapActionFeature::FastMode),
     action("global", "Global", "toggle_raw_output", "Toggle raw scrollback mode."),
     action("global", "Global", "toggle_side_conversation", "Switch between a side conversation and its parent."),
+    action("global", "Global", "leader", "Set the prefix used by shared leader shortcuts."),
     action("chat", "Chat", "interrupt_turn", "Interrupt the active turn."),
     action("chat", "Chat", "decrease_reasoning_effort", "Decrease reasoning effort."),
     action("chat", "Chat", "increase_reasoning_effort", "Increase reasoning effort."),
     action("chat", "Chat", "previous_permission_mode", "Switch to the previous available permission mode."),
     action("chat", "Chat", "next_permission_mode", "Switch to the next available permission mode."),
-    action("chat", "Chat", "edit_queued_message", "Edit the most recently queued message."),
+    action("chat", "Chat", "edit_queued_message", "Move forward through questions, then edit the last queued message."),
+    action("chat", "Chat", "prompt_stack_back", "Move back through questions toward the composer."),
+    action("chat", "Chat", "skip_question", "Skip the focused question."),
+    action("chat", "Chat", "toggle_voice", "Start or stop a voice conversation."),
+    action("chat", "Chat", "toggle_voice_mute", "Mute or unmute the voice microphone."),
     action("composer", "Composer", "submit", "Submit the current composer draft."),
     action("composer", "Composer", "queue", "Queue the draft while a task is running."),
     action("composer", "Composer", "toggle_shortcuts", "Show or hide the composer shortcut overlay."),
@@ -127,6 +136,7 @@ pub(super) const KEYMAP_ACTIONS: &[KeymapActionDescriptor] = &[
     action("vim_normal", "Vim normal", "insert_line_start", "Enter insert mode at the first non-blank character."),
     action("vim_normal", "Vim normal", "open_line_below", "Open a new line below and enter insert mode."),
     action("vim_normal", "Vim normal", "open_line_above", "Open a new line above and enter insert mode."),
+    action("vim_normal", "Vim normal", "enter_replace_mode", "Enter replace mode and overwrite characters."),
     action("vim_normal", "Vim normal", "move_left", "Move left in Vim normal mode."),
     action("vim_normal", "Vim normal", "move_right", "Move right in Vim normal mode."),
     action("vim_normal", "Vim normal", "move_up", "Move up or recall older history in Vim normal mode."),
@@ -199,6 +209,7 @@ pub(super) const KEYMAP_ACTIONS: &[KeymapActionDescriptor] = &[
     action("pager", "Pager", "jump_bottom", "Jump to the end."),
     action("pager", "Pager", "close", "Close the pager overlay."),
     action("pager", "Pager", "close_transcript", "Close the transcript overlay."),
+    action("pager", "Pager", "find", "Find text in a transcript pager."),
     action("list", "List", "move_up", "Move list selection up."),
     action("list", "List", "move_down", "Move list selection down."),
     action("list", "List", "move_left", "Move horizontally left in list pickers."),
@@ -209,11 +220,17 @@ pub(super) const KEYMAP_ACTIONS: &[KeymapActionDescriptor] = &[
     action("list", "List", "jump_bottom", "Jump to the last list item."),
     action("list", "List", "accept", "Accept the current list selection."),
     action("list", "List", "cancel", "Cancel and close selection views."),
+    action("agents", "Agents", "resume", "Open the session resume picker."),
     action("agents", "Agents", "search", "Search the available agent tasks."),
-    action("agents", "Agents", "new_task", "Start composing a new agent task."),
+    action("agents", "Agents", "new_task", "Open a new session in the selected checkout."),
+    action("agents", "Agents", "new_worktree", "Open a new session in a worktree from the project default branch."),
+    action("agents", "Agents", "fork", "Fork the selected conversation and open the new session."),
     action("agents", "Agents", "rename", "Rename the selected task."),
     action("agents", "Agents", "stop", "Stop the selected running task."),
-    action("agents", "Agents", "toggle_grouping", "Group tasks by status or project."),
+    action("agents", "Agents", "archive", "Archive the selected task and its child agents."),
+    action("agents", "Agents", "delete", "Permanently delete the selected task and its child agents."),
+    action("agents", "Agents", "hide", "Hide the selected task until explicitly resumed."),
+    action("agents", "Agents", "toggle_grouping", "Cycle task grouping by project, status, or model."),
     action("approval", "Approval", "open_fullscreen", "Open approval details fullscreen."),
     action("approval", "Approval", "open_thread", "Open the approval source thread when available."),
     action("approval", "Approval", "approve", "Approve the primary option."),
@@ -256,8 +273,11 @@ pub(super) fn binding_slot<'a>(
     action: &str,
 ) -> Option<&'a mut Option<KeybindingsSpec>> {
     match (context, action) {
+        ("global", "leader") => Some(&mut keymap.global.leader),
         ("global", "open_agents") => Some(&mut keymap.global.open_agents),
         ("global", "open_transcript") => Some(&mut keymap.global.open_transcript),
+        ("global", "find_transcript") => Some(&mut keymap.global.find_transcript),
+        ("global", "focus_activity") => Some(&mut keymap.global.focus_activity),
         ("global", "open_external_editor") => Some(&mut keymap.global.open_external_editor),
         ("global", "copy") => Some(&mut keymap.global.copy),
         ("global", "clear_terminal") => Some(&mut keymap.global.clear_terminal),
@@ -271,6 +291,10 @@ pub(super) fn binding_slot<'a>(
         ("chat", "previous_permission_mode") => Some(&mut keymap.chat.previous_permission_mode),
         ("chat", "next_permission_mode") => Some(&mut keymap.chat.next_permission_mode),
         ("chat", "edit_queued_message") => Some(&mut keymap.chat.edit_queued_message),
+        ("chat", "prompt_stack_back") => Some(&mut keymap.chat.prompt_stack_back),
+        ("chat", "skip_question") => Some(&mut keymap.chat.skip_question),
+        ("chat", "toggle_voice") => Some(&mut keymap.chat.toggle_voice),
+        ("chat", "toggle_voice_mute") => Some(&mut keymap.chat.toggle_voice_mute),
         ("composer", "submit") => Some(&mut keymap.composer.submit),
         ("composer", "queue") => Some(&mut keymap.composer.queue),
         ("composer", "toggle_shortcuts") => Some(&mut keymap.composer.toggle_shortcuts),
@@ -299,6 +323,7 @@ pub(super) fn binding_slot<'a>(
         ("vim_normal", "insert_line_start") => Some(&mut keymap.vim_normal.insert_line_start),
         ("vim_normal", "open_line_below") => Some(&mut keymap.vim_normal.open_line_below),
         ("vim_normal", "open_line_above") => Some(&mut keymap.vim_normal.open_line_above),
+        ("vim_normal", "enter_replace_mode") => Some(&mut keymap.vim_normal.enter_replace_mode),
         ("vim_normal", "move_left") => Some(&mut keymap.vim_normal.move_left),
         ("vim_normal", "move_right") => Some(&mut keymap.vim_normal.move_right),
         ("vim_normal", "move_up") => Some(&mut keymap.vim_normal.move_up),
@@ -371,6 +396,7 @@ pub(super) fn binding_slot<'a>(
         ("pager", "jump_bottom") => Some(&mut keymap.pager.jump_bottom),
         ("pager", "close") => Some(&mut keymap.pager.close),
         ("pager", "close_transcript") => Some(&mut keymap.pager.close_transcript),
+        ("pager", "find") => Some(&mut keymap.pager.find),
         ("list", "move_up") => Some(&mut keymap.list.move_up),
         ("list", "move_down") => Some(&mut keymap.list.move_down),
         ("list", "move_left") => Some(&mut keymap.list.move_left),
@@ -381,10 +407,16 @@ pub(super) fn binding_slot<'a>(
         ("list", "jump_bottom") => Some(&mut keymap.list.jump_bottom),
         ("list", "accept") => Some(&mut keymap.list.accept),
         ("list", "cancel") => Some(&mut keymap.list.cancel),
+        ("agents", "resume") => Some(&mut keymap.agents.resume),
         ("agents", "search") => Some(&mut keymap.agents.search),
         ("agents", "new_task") => Some(&mut keymap.agents.new_task),
+        ("agents", "new_worktree") => Some(&mut keymap.agents.new_worktree),
+        ("agents", "fork") => Some(&mut keymap.agents.fork),
         ("agents", "rename") => Some(&mut keymap.agents.rename),
         ("agents", "stop") => Some(&mut keymap.agents.stop),
+        ("agents", "archive") => Some(&mut keymap.agents.archive),
+        ("agents", "delete") => Some(&mut keymap.agents.delete),
+        ("agents", "hide") => Some(&mut keymap.agents.hide),
         ("agents", "toggle_grouping") => Some(&mut keymap.agents.toggle_grouping),
         ("approval", "open_fullscreen") => Some(&mut keymap.approval.open_fullscreen),
         ("approval", "open_thread") => Some(&mut keymap.approval.open_thread),
@@ -418,6 +450,23 @@ pub(super) fn format_action_binding_summary(
     let specs = specs
         .into_iter()
         .filter(|spec| seen.insert(spec.clone()))
+        .map(|spec| {
+            let Some(completion) = spec.strip_prefix("leader ") else {
+                return spec;
+            };
+            let resolved = runtime_keymap
+                .chords
+                .leader
+                .iter()
+                .filter_map(|prefix| super::binding_to_config_key_spec(*prefix).ok())
+                .map(|prefix| format!("{prefix} {completion}"))
+                .collect::<Vec<_>>();
+            if resolved.is_empty() {
+                format!("{spec} (inactive)")
+            } else {
+                format!("{spec} ({})", resolved.join(", "))
+            }
+        })
         .collect::<Vec<_>>();
     if specs.is_empty() {
         "unbound".to_string()

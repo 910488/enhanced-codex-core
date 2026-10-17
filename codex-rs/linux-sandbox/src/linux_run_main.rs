@@ -22,12 +22,16 @@ use std::time::Duration;
 
 use crate::bwrap::BwrapNetworkMode;
 use crate::bwrap::BwrapOptions;
+use crate::bwrap::WSL_INTEROP_DIR;
+use crate::bwrap::WSLG_DISTRO_ROOT;
 use crate::bwrap::create_bwrap_command_args;
-use crate::landlock::apply_permission_profile_to_current_thread;
 use crate::launcher::exec_bwrap;
+use crate::launcher::initialize_bwrap_launcher;
 use crate::launcher::preferred_bwrap_supports_argv0;
 use crate::proxy_routing::activate_proxy_routes_in_netns;
 use crate::proxy_routing::prepare_host_proxy_route_spec;
+use crate::seccomp::apply_permission_profile_to_current_thread;
+use codex_network_proxy::ManagedNetworkSandboxContext;
 use codex_protocol::error::Result as CodexResult;
 use codex_protocol::models::PermissionProfile;
 use codex_protocol::protocol::FileSystemAccessMode;
@@ -82,10 +86,8 @@ enum ProtectedCreateRemoval {
 #[derive(Debug, Parser)]
 /// CLI surface for the Linux sandbox helper.
 ///
-/// The type name remains `LandlockCommand` for compatibility with existing
-/// wiring, but bubblewrap is now the default filesystem sandbox and Landlock
-/// is the legacy fallback.
-pub struct LandlockCommand {
+/// Uses bubblewrap for filesystem isolation and seccomp for syscall filtering.
+pub struct LinuxSandboxCommand {
     /// It is possible that the cwd used in the context of the sandbox policy
     /// is different from the cwd of the process to spawn.
     #[arg(long = "sandbox-policy-cwd")]
@@ -122,13 +124,13 @@ pub struct LandlockCommand {
     #[arg(long = "apply-seccomp-then-exec", hide = true, default_value_t = false)]
     pub apply_seccomp_then_exec: bool,
 
-    /// Internal compatibility flag.
-    ///
-    /// By default, restricted-network sandboxing uses isolated networking.
-    /// If set, sandbox setup switches to proxy-only network mode with
-    /// managed routing bridges.
-    #[arg(long = "allow-network-for-proxy", hide = true, default_value_t = false)]
-    pub allow_network_for_proxy: bool,
+    /// Effective managed-network policy prepared for this command launch.
+    #[arg(
+        long,
+        hide = true,
+        value_parser = parse_managed_network
+    )]
+    pub managed_network: Option<ManagedNetworkSandboxContext>,
 
     /// Internal route spec used for managed proxy routing in bwrap mode.
     #[arg(long = "proxy-route-spec", hide = true)]
@@ -144,6 +146,11 @@ pub struct LandlockCommand {
     #[arg(long = "no-proc", default_value_t = false)]
     pub no_proc: bool,
 
+    /// Reuse the caller's PID namespace and `/proc` together.
+    /// Only trusted executor startup may select this mode.
+    #[arg(long = "inherit-pid-namespace", hide = true)]
+    pub inherit_pid_namespace: bool,
+
     /// Full command args to run under the Linux sandbox helper.
     #[arg(trailing_var_arg = true)]
     pub command: Vec<String>,
@@ -157,18 +164,20 @@ pub struct LandlockCommand {
 /// 2. Apply in-process restrictions (no_new_privs + seccomp).
 /// 3. `execvp` into the final command.
 pub fn run_main() -> ! {
-    let LandlockCommand {
+    let LinuxSandboxCommand {
         sandbox_policy_cwd,
         command_cwd,
         permission_profile,
         use_legacy_landlock,
         apply_seccomp_then_exec,
-        allow_network_for_proxy,
+        managed_network,
         proxy_route_spec,
         verify_fd_mounts,
         no_proc,
+        inherit_pid_namespace,
         command,
-    } = LandlockCommand::parse();
+    } = LinuxSandboxCommand::parse();
+    let allow_network_for_proxy = managed_network.is_some();
 
     if command.is_empty() {
         panic!("No command specified to execute.");
@@ -182,12 +191,7 @@ pub fn run_main() -> ! {
         file_system_sandbox_policy,
         network_sandbox_policy,
     } = resolve_permission_profile(permission_profile).unwrap_or_else(|err| panic!("{err}"));
-    ensure_legacy_landlock_mode_supports_policy(
-        use_legacy_landlock,
-        &file_system_sandbox_policy,
-        network_sandbox_policy,
-        &sandbox_policy_cwd,
-    );
+    ensure_legacy_landlock_mode_supports_policy(use_legacy_landlock, &file_system_sandbox_policy);
 
     // Inner stage: apply seccomp/no_new_privs after bubblewrap has already
     // established the filesystem view.
@@ -233,7 +237,7 @@ pub fn run_main() -> ! {
             &permission_profile,
             &sandbox_policy_cwd,
             /*apply_landlock_fs*/ false,
-            allow_network_for_proxy,
+            managed_network.as_ref(),
             proxy_routing_active,
         ) {
             panic!("error applying Linux sandbox restrictions: {e:?}");
@@ -279,8 +283,8 @@ pub fn run_main() -> ! {
             &permission_profile,
             &sandbox_policy_cwd,
             /*apply_landlock_fs*/ false,
-            allow_network_for_proxy,
-            /*proxy_routed_network*/ false,
+            managed_network.as_ref(),
+            /*proxy_routing_active*/ false,
         ) {
             panic!("error applying Linux sandbox restrictions: {e:?}");
         }
@@ -298,11 +302,37 @@ pub fn run_main() -> ! {
         } else {
             (None, Vec::new())
         };
+        let options = BwrapOptions {
+            mount_proc: !no_proc && !inherit_pid_namespace,
+            inherit_pid_namespace,
+            network_mode: bwrap_network_mode(network_sandbox_policy, allow_network_for_proxy),
+            mask_wsl_interop: !file_system_sandbox_policy.has_full_disk_write_access()
+                && Path::new(WSL_INTEROP_DIR).is_dir(),
+            mask_wslg_distro: (!file_system_sandbox_policy.has_full_disk_write_access()
+                || !file_system_sandbox_policy
+                    .get_unreadable_globs_with_cwd(&sandbox_policy_cwd)
+                    .is_empty())
+                && crate::wslg::is_duplicate_root(Path::new(WSLG_DISTRO_ROOT))
+                    .unwrap_or_else(|err| exit_with_bwrap_build_error(err.into())),
+            ..Default::default()
+        };
+        if options.mask_wslg_distro
+            && let Some(executable) = command
+                .first()
+                .filter(|executable| executable.contains('/'))
+        {
+            let executable = command_cwd
+                .as_deref()
+                .unwrap_or(&sandbox_policy_cwd)
+                .join(executable);
+            crate::wslg::ensure_supported_path(&executable)
+                .unwrap_or_else(|err| exit_with_bwrap_build_error(err));
+        }
         let inner = build_inner_seccomp_command(InnerSeccompCommandArgs {
             sandbox_policy_cwd: &sandbox_policy_cwd,
             command_cwd: command_cwd.as_deref(),
             permission_profile: &permission_profile,
-            allow_network_for_proxy,
+            managed_network,
             proxy_route_spec,
             command,
         });
@@ -310,20 +340,19 @@ pub fn run_main() -> ! {
             &sandbox_policy_cwd,
             command_cwd.as_deref(),
             &file_system_sandbox_policy,
-            bwrap_network_mode(network_sandbox_policy, allow_network_for_proxy),
+            options,
             inner,
             proxy_controls,
-            !no_proc,
         );
     }
 
-    // Legacy path: Landlock enforcement only, when bwrap sandboxing is not enabled.
+    // Legacy pipeline: apply in-process restrictions without bubblewrap.
     if let Err(e) = apply_permission_profile_to_current_thread(
         &permission_profile,
         &sandbox_policy_cwd,
         /*apply_landlock_fs*/ true,
-        allow_network_for_proxy,
-        /*proxy_routed_network*/ false,
+        managed_network.as_ref(),
+        /*proxy_routing_active*/ false,
     ) {
         panic!("error applying legacy Linux sandbox restrictions: {e:?}");
     }
@@ -354,6 +383,11 @@ fn parse_permission_profile(value: &str) -> std::result::Result<PermissionProfil
     serde_json::from_str(value).map_err(|err| format!("invalid permission profile JSON: {err}"))
 }
 
+fn parse_managed_network(value: &str) -> std::result::Result<ManagedNetworkSandboxContext, String> {
+    serde_json::from_str(value)
+        .map_err(|err| format!("invalid managed network context JSON: {err}"))
+}
+
 fn resolve_permission_profile(
     permission_profile: Option<PermissionProfile>,
 ) -> Result<EffectivePermissions, ResolvePermissionProfileError> {
@@ -377,16 +411,9 @@ fn ensure_inner_stage_mode_is_valid(apply_seccomp_then_exec: bool, use_legacy_la
 fn ensure_legacy_landlock_mode_supports_policy(
     use_legacy_landlock: bool,
     file_system_sandbox_policy: &FileSystemSandboxPolicy,
-    network_sandbox_policy: NetworkSandboxPolicy,
-    sandbox_policy_cwd: &Path,
 ) {
-    if use_legacy_landlock
-        && file_system_sandbox_policy
-            .needs_direct_runtime_enforcement(network_sandbox_policy, sandbox_policy_cwd)
-    {
-        panic!(
-            "permission profiles requiring direct runtime enforcement are incompatible with --use-legacy-landlock"
-        );
+    if use_legacy_landlock && !file_system_sandbox_policy.has_full_disk_write_access() {
+        panic!("filesystem-restricted execution requires bubblewrap to isolate app-server sockets");
     }
 }
 
@@ -394,28 +421,24 @@ fn run_bwrap_with_proc_fallback(
     sandbox_policy_cwd: &Path,
     command_cwd: Option<&Path>,
     file_system_sandbox_policy: &FileSystemSandboxPolicy,
-    network_mode: BwrapNetworkMode,
+    mut options: BwrapOptions,
     inner: Vec<String>,
     proxy_controls: Vec<File>,
-    mount_proc: bool,
 ) -> ! {
-    let mut mount_proc = mount_proc;
     let command_cwd = command_cwd.unwrap_or(sandbox_policy_cwd);
 
-    if mount_proc
-        && !preflight_proc_mount_support(network_mode)
+    // Select before the preflight, whose synthetic policy omits writable roots.
+    initialize_bwrap_launcher(file_system_sandbox_policy, sandbox_policy_cwd);
+
+    if options.mount_proc
+        && !preflight_proc_mount_support(options)
             .unwrap_or_else(|err| exit_with_bwrap_build_error(err))
     {
         // Keep the retry silent so sandbox-internal diagnostics do not leak into the
         // child process stderr stream.
-        mount_proc = false;
+        options.mount_proc = false;
     }
 
-    let options = BwrapOptions {
-        mount_proc,
-        network_mode,
-        ..Default::default()
-    };
     let mut bwrap_args = build_bwrap_argv(
         inner,
         file_system_sandbox_policy,
@@ -512,15 +535,13 @@ fn current_process_argv0() -> String {
     }
 }
 
-fn preflight_proc_mount_support(network_mode: BwrapNetworkMode) -> CodexResult<bool> {
-    let preflight_argv = build_preflight_bwrap_argv(network_mode)?;
+fn preflight_proc_mount_support(options: BwrapOptions) -> CodexResult<bool> {
+    let preflight_argv = build_preflight_bwrap_argv(options)?;
     let stderr = run_bwrap_in_child_capture_stderr(preflight_argv);
     Ok(!is_proc_mount_failure(stderr.as_str()))
 }
 
-fn build_preflight_bwrap_argv(
-    network_mode: BwrapNetworkMode,
-) -> CodexResult<crate::bwrap::BwrapArgs> {
+fn build_preflight_bwrap_argv(options: BwrapOptions) -> CodexResult<crate::bwrap::BwrapArgs> {
     let file_system_sandbox_policy =
         FileSystemSandboxPolicy::restricted(vec![FileSystemSandboxEntry {
             path: FileSystemPath::Special {
@@ -537,8 +558,8 @@ fn build_preflight_bwrap_argv(
         Path::new("/"),
         BwrapOptions {
             mount_proc: true,
-            network_mode,
-            ..Default::default()
+            // The alias check must see the same WSL masks as the main sandbox.
+            ..options
         },
     )
 }
@@ -1502,7 +1523,7 @@ struct InnerSeccompCommandArgs<'a> {
     sandbox_policy_cwd: &'a Path,
     command_cwd: Option<&'a Path>,
     permission_profile: &'a PermissionProfile,
-    allow_network_for_proxy: bool,
+    managed_network: Option<ManagedNetworkSandboxContext>,
     proxy_route_spec: Option<String>,
     command: Vec<String>,
 }
@@ -1513,7 +1534,7 @@ fn build_inner_seccomp_command(args: InnerSeccompCommandArgs<'_>) -> Vec<String>
         sandbox_policy_cwd,
         command_cwd,
         permission_profile,
-        allow_network_for_proxy,
+        managed_network,
         proxy_route_spec,
         command,
     } = args;
@@ -1540,8 +1561,12 @@ fn build_inner_seccomp_command(args: InnerSeccompCommandArgs<'_>) -> Vec<String>
         permission_profile_json,
         "--apply-seccomp-then-exec".to_string(),
     ]);
-    if allow_network_for_proxy {
-        inner.push("--allow-network-for-proxy".to_string());
+    if let Some(managed_network) = managed_network {
+        inner.push("--managed-network".to_string());
+        inner.push(
+            serde_json::to_string(&managed_network)
+                .unwrap_or_else(|err| panic!("failed to serialize managed network context: {err}")),
+        );
         let proxy_route_spec = proxy_route_spec
             .unwrap_or_else(|| panic!("managed proxy mode requires a proxy route spec"));
         inner.push("--proxy-route-spec".to_string());

@@ -1,12 +1,14 @@
 //! Inserts finalized history rows into terminal scrollback.
 //!
 //! Codex uses the terminal scrollback itself for finalized chat history, so inserting a history
-//! cell is an escape-sequence operation rather than a normal ratatui render.
+//! cell is an escape-sequence operation rather than a normal ratatui render. Untrusted content
+//! follows ratatui’s control-character filtering before semantic hyperlinks add trusted escapes.
 
 use std::fmt;
 use std::io;
 use std::io::Write;
 
+use crate::custom_terminal::ModifierDiff;
 use crate::render::line_utils::line_to_static;
 use crate::terminal_hyperlinks::HyperlinkLine;
 use crate::terminal_hyperlinks::decorate_spans;
@@ -332,6 +334,7 @@ fn write_history_line<W: Write>(
         })
         .collect();
     let merged_line = HyperlinkLine {
+        source: None,
         line: Line::from(merged_spans),
         hyperlinks: line.hyperlinks.clone(),
     };
@@ -376,73 +379,6 @@ impl Command for ResetScrollRegion {
     fn is_ansi_code_supported(&self) -> bool {
         // TODO(nornagon): is this supported on Windows?
         true
-    }
-}
-
-struct ModifierDiff {
-    pub from: Modifier,
-    pub to: Modifier,
-}
-
-impl ModifierDiff {
-    fn queue<W>(self, mut w: W) -> io::Result<()>
-    where
-        W: io::Write,
-    {
-        use crossterm::style::Attribute as CAttribute;
-        let removed = self.from - self.to;
-        if removed.contains(Modifier::REVERSED) {
-            queue!(w, SetAttribute(CAttribute::NoReverse))?;
-        }
-        if removed.contains(Modifier::BOLD) {
-            queue!(w, SetAttribute(CAttribute::NormalIntensity))?;
-            if self.to.contains(Modifier::DIM) {
-                queue!(w, SetAttribute(CAttribute::Dim))?;
-            }
-        }
-        if removed.contains(Modifier::ITALIC) {
-            queue!(w, SetAttribute(CAttribute::NoItalic))?;
-        }
-        if removed.contains(Modifier::UNDERLINED) {
-            queue!(w, SetAttribute(CAttribute::NoUnderline))?;
-        }
-        if removed.contains(Modifier::DIM) {
-            queue!(w, SetAttribute(CAttribute::NormalIntensity))?;
-        }
-        if removed.contains(Modifier::CROSSED_OUT) {
-            queue!(w, SetAttribute(CAttribute::NotCrossedOut))?;
-        }
-        if removed.contains(Modifier::SLOW_BLINK) || removed.contains(Modifier::RAPID_BLINK) {
-            queue!(w, SetAttribute(CAttribute::NoBlink))?;
-        }
-
-        let added = self.to - self.from;
-        if added.contains(Modifier::REVERSED) {
-            queue!(w, SetAttribute(CAttribute::Reverse))?;
-        }
-        if added.contains(Modifier::BOLD) {
-            queue!(w, SetAttribute(CAttribute::Bold))?;
-        }
-        if added.contains(Modifier::ITALIC) {
-            queue!(w, SetAttribute(CAttribute::Italic))?;
-        }
-        if added.contains(Modifier::UNDERLINED) {
-            queue!(w, SetAttribute(CAttribute::Underlined))?;
-        }
-        if added.contains(Modifier::DIM) {
-            queue!(w, SetAttribute(CAttribute::Dim))?;
-        }
-        if added.contains(Modifier::CROSSED_OUT) {
-            queue!(w, SetAttribute(CAttribute::CrossedOut))?;
-        }
-        if added.contains(Modifier::SLOW_BLINK) {
-            queue!(w, SetAttribute(CAttribute::SlowBlink))?;
-        }
-        if added.contains(Modifier::RAPID_BLINK) {
-            queue!(w, SetAttribute(CAttribute::RapidBlink))?;
-        }
-
-        Ok(())
     }
 }
 
@@ -527,16 +463,38 @@ mod tests {
     }
 
     #[test]
-    fn writes_semantic_web_link_without_changing_visible_text() {
+    fn writes_semantic_web_link_without_emitting_untrusted_controls() {
+        use pretty_assertions::assert_eq;
+
         let destination = "https://example.com/long/path";
-        let line = crate::terminal_hyperlinks::annotate_web_urls_in_line(Line::from(destination));
-        let mut actual = Vec::new();
-
-        write_history_line(&mut actual, &line, /*wrap_width*/ 80).expect("write history line");
-
-        let output = String::from_utf8(actual).expect("UTF-8 terminal output");
-        assert!(output.contains("\x1b]8;;https://example.com/long/path\x07"));
-        assert_eq!(line.line.spans[0].content, destination);
+        for linked in [false, true] {
+            let mut line = crate::terminal_hyperlinks::annotate_web_urls_in_line(Line::from(vec![
+                "\x1b[2J\x1b]52;c;Y2xpcA==\x07\u{009d}hidden\u{009c}\r\n\t ".into(),
+                destination.into(),
+            ]));
+            let mut safe = crate::terminal_hyperlinks::annotate_web_urls_in_line(Line::from(vec![
+                "[2J]52;c;Y2xpcA==hidden ".into(),
+                destination.into(),
+            ]));
+            if !linked {
+                line.hyperlinks.clear();
+                safe.hyperlinks.clear();
+            }
+            let original = line.clone();
+            let mut actual = Vec::new();
+            let mut expected = Vec::new();
+            write_history_line(&mut actual, &line, /*wrap_width*/ 80).unwrap();
+            write_history_line(&mut expected, &safe, /*wrap_width*/ 80).unwrap();
+            assert_eq!(actual, expected);
+            assert_eq!(line, original);
+            let output = String::from_utf8(actual).unwrap();
+            assert_eq!(
+                output.contains(&format!(
+                    "\x1b]8;;{destination}\x07{destination}\x1b]8;;\x07"
+                )),
+                linked,
+            );
+        }
     }
 
     #[test]
@@ -751,7 +709,13 @@ mod tests {
     fn vt100_deep_nested_mixed_list_third_level_marker_is_colored() {
         // Markdown with five levels (ordered → unordered → ordered → unordered → unordered).
         let md = "1. First\n   - Second level\n     1. Third level (ordered)\n        - Fourth level (bullet)\n          - Fifth level to test indent consistency\n";
-        let text = render_markdown_text(md);
+        let text = crate::terminal_palette::with_test_default_colors(
+            crate::terminal_probe::DefaultColors {
+                fg: (240, 240, 240),
+                bg: (24, 24, 24),
+            },
+            || render_markdown_text(md),
+        );
         let lines: Vec<Line<'static>> = text.lines.clone();
 
         let width: u16 = 60;
@@ -870,6 +834,7 @@ mod tests {
 
         let url = "https://example.test/forwarded/threads/10930?page=1&queue=customer_support_unprocessed&forwardedScope=all";
         let cell = UserHistoryCell {
+            spoken: false,
             message: url.to_string(),
             text_elements: Vec::new(),
             local_image_paths: Vec::new(),

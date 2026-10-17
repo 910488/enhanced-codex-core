@@ -33,7 +33,7 @@ use crate::EnvironmentRegistryHarnessKeyValidationResponse;
 use crate::EnvironmentRegistryRegistrationRequest;
 use crate::EnvironmentRegistryRegistrationResponse;
 use crate::ExecServerError;
-use crate::ExecServerRuntimePaths;
+use crate::ExecServerRuntimeOptions;
 use crate::ExecServerTelemetry;
 use crate::NoiseChannelIdentity;
 use crate::NoiseChannelPublicKey;
@@ -50,10 +50,27 @@ use crate::server::RequestDispatchMode;
 use crate::trace_context::current_rendezvous_headers;
 use crate::trace_context::current_trace_context_headers;
 
+#[path = "remote/direct.rs"]
+mod direct;
+
+use direct::run_direct_environment;
+
 const ERROR_BODY_PREVIEW_BYTES: usize = 4096;
 const NOISE_RELAY_SECURITY_PROFILE: &str = "noise_hybrid_ik_v1";
 
+#[path = "remote/connection_diagnostics.rs"]
+mod connection_diagnostics;
+mod reconnect_backoff;
 mod registration_retry;
+
+/// Wire transport used after registering a remote exec-server.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+/// The transport used to connect a remote exec-server environment.
+pub enum RemoteEnvironmentTransport {
+    #[default]
+    Noise,
+    Direct,
+}
 
 #[derive(Clone)]
 struct EnvironmentRegistryClient {
@@ -281,7 +298,7 @@ impl EnvironmentRegistryClient {
             let body = response
                 .text()
                 .await
-                .map_err(|error| ExecServerError::EnvironmentRegistryRequest(error.into()))?;
+                .map_err(ExecServerError::EnvironmentRegistryRequest)?;
             return serde_json::from_str(&body).map_err(ExecServerError::Json);
         }
 
@@ -358,7 +375,7 @@ impl HarnessKeyValidator for RegistryHarnessKeyValidator {
         let response = response
             .json::<EnvironmentRegistryHarnessKeyValidationResponse>()
             .await
-            .map_err(|error| ExecServerError::EnvironmentRegistryRequest(error.into()))?;
+            .map_err(ExecServerError::EnvironmentRegistryRequest)?;
         if !response.valid {
             return Err(ExecServerError::Protocol(
                 "environment registry rejected Noise relay harness key".to_string(),
@@ -515,6 +532,7 @@ pub struct RemoteEnvironmentConfig {
     pub environment_id: String,
     pub name: String,
     pub request_dispatch_mode: RequestDispatchMode,
+    transport: RemoteEnvironmentTransport,
     auth_provider: SharedAuthProvider,
     telemetry: ExecServerTelemetry,
     http_client_factory: HttpClientFactory,
@@ -527,15 +545,34 @@ impl std::fmt::Debug for RemoteEnvironmentConfig {
             .field("environment_id", &self.environment_id)
             .field("name", &self.name)
             .field("request_dispatch_mode", &self.request_dispatch_mode)
+            .field("transport", &self.transport)
             .field("auth_provider", &"<redacted>")
             .finish()
     }
 }
 
 impl RemoteEnvironmentConfig {
+    /// Creates a remote environment configuration using the default Noise transport.
     pub fn new(
         base_url: String,
         environment_id: String,
+        auth_provider: SharedAuthProvider,
+        http_client_factory: HttpClientFactory,
+    ) -> Result<Self, ExecServerError> {
+        Self::new_with_transport(
+            base_url,
+            environment_id,
+            RemoteEnvironmentTransport::Noise,
+            auth_provider,
+            http_client_factory,
+        )
+    }
+
+    /// Creates a remote environment configuration using an explicit transport.
+    pub fn new_with_transport(
+        base_url: String,
+        environment_id: String,
+        transport: RemoteEnvironmentTransport,
         auth_provider: SharedAuthProvider,
         http_client_factory: HttpClientFactory,
     ) -> Result<Self, ExecServerError> {
@@ -545,6 +582,7 @@ impl RemoteEnvironmentConfig {
             environment_id,
             name: "codex-exec-server".to_string(),
             request_dispatch_mode: RequestDispatchMode::Inline,
+            transport,
             auth_provider,
             telemetry: ExecServerTelemetry::default(),
             http_client_factory,
@@ -557,15 +595,18 @@ impl RemoteEnvironmentConfig {
     }
 }
 
-/// Register an exec-server for remote use and serve requests over Noise.
+/// Register an exec-server for remote use and serve requests over its configured transport.
 ///
-/// The executor identity is generated once per process and reused across
+/// In Noise mode, the executor identity is generated once per process and reused across
 /// reconnects. The registration and rendezvous URL are also reused until
 /// rendezvous rejects the URL, at which point the next attempt registers again.
 /// The websocket carries cleartext routing metadata and encrypted payloads.
+///
+/// Direct mode reuses its registration across reconnects. A WebSocket handshake
+/// conflict refreshes the registration; other permanent client errors stop the runner.
 pub async fn run_remote_environment(
     config: RemoteEnvironmentConfig,
-    runtime_paths: ExecServerRuntimePaths,
+    runtime_paths: ExecServerRuntimeOptions,
 ) -> Result<(), ExecServerError> {
     run_remote_environment_until_shutdown(config, runtime_paths, std::future::pending()).await
 }
@@ -575,7 +616,7 @@ pub async fn run_remote_environment(
 /// Active sessions and their processes are drained before this function returns.
 pub async fn run_remote_environment_until_shutdown<F>(
     config: RemoteEnvironmentConfig,
-    runtime_paths: ExecServerRuntimePaths,
+    runtime_paths: ExecServerRuntimeOptions,
     shutdown: F,
 ) -> Result<(), ExecServerError>
 where
@@ -588,7 +629,20 @@ where
         config.request_dispatch_mode,
     );
 
-    let result = run_remote_transport(config, processor.clone(), shutdown).await;
+    let result = match config.transport {
+        RemoteEnvironmentTransport::Noise => {
+            run_remote_transport(config, shutdown, |config, client| {
+                run_remote_environment_connections(config, client, processor.clone())
+            })
+            .await
+        }
+        RemoteEnvironmentTransport::Direct => {
+            run_remote_transport(config, shutdown, |config, client| {
+                run_direct_environment(config, client, processor.clone())
+            })
+            .await
+        }
+    };
     processor.shutdown().await;
     result
 }
@@ -602,22 +656,35 @@ pub async fn run_remote_environment_forward_until_shutdown<F>(
 where
     F: std::future::Future<Output = ()>,
 {
+    // Forwarder implements the Noise stream bridge. Direct forwarding needs a
+    // separate Direct-compatible bridge, so reject it rather than use the
+    // Noise-specific path.
+    // Remove this guard when a Direct-compatible forwarder is added.
+    if config.transport == RemoteEnvironmentTransport::Direct {
+        return Err(ExecServerError::EnvironmentRegistryConfig(
+            "direct exec-server transport does not support forwarding".to_string(),
+        ));
+    }
     let forwarder = Forwarder::new(
         websocket_url,
         &config.http_client_factory,
         config.telemetry.clone(),
     )?;
-    run_remote_transport(config, forwarder, shutdown).await
+    run_remote_transport(config, shutdown, |config, client| {
+        run_remote_environment_connections(config, client, forwarder)
+    })
+    .await
 }
 
-async fn run_remote_transport<F, H>(
+async fn run_remote_transport<F, R, T>(
     config: RemoteEnvironmentConfig,
-    handler: H,
     shutdown: F,
+    run_loop: R,
 ) -> Result<(), ExecServerError>
 where
     F: std::future::Future<Output = ()>,
-    H: NoiseStreamHandler,
+    R: FnOnce(RemoteEnvironmentConfig, EnvironmentRegistryClient) -> T,
+    T: std::future::Future<Output = Result<(), ExecServerError>>,
 {
     ensure_rustls_crypto_provider();
     let client = EnvironmentRegistryClient::new_with_telemetry(
@@ -626,7 +693,7 @@ where
         config.telemetry.clone(),
         config.http_client_factory.clone(),
     )?;
-    let run = run_remote_environment_connections(config, client, handler);
+    let run = run_loop(config, client);
     tokio::pin!(run, shutdown);
     tokio::select! {
         result = &mut run => result,
@@ -642,25 +709,31 @@ async fn run_remote_environment_connections<H: NoiseStreamHandler>(
     let identity = NoiseChannelIdentity::generate().map_err(|error| {
         ExecServerError::Protocol(format!("failed to generate Noise relay identity: {error}"))
     })?;
-    let mut backoff = Duration::from_secs(1);
+    let mut backoff = reconnect_backoff::ReconnectBackoff::new();
     let mut response = client
         .register_environment_with_retry(&config.environment_id, &identity.public_key())
         .await?;
 
+    let mut connection_attempt = 0_u64;
     loop {
+        connection_attempt += 1;
+        let request_id = format!("req_{}", uuid::Uuid::new_v4().simple());
         match connect_rendezvous(
             &response.url,
+            &request_id,
             &config.telemetry,
             &config.http_client_factory,
         )
         .await
         {
             Ok(websocket) => {
-                backoff = Duration::from_secs(1);
+                let connected_at = tokio::time::Instant::now();
                 let executor_registration_id = response.executor_registration_id.clone();
                 info!(
                     noise_event = "rendezvous_connection",
                     noise_outcome = "ok",
+                    request_id,
+                    connection_attempt,
                     "Noise executor connected to rendezvous"
                 );
                 let disconnect_reason = run_multiplexed_environment(
@@ -676,10 +749,13 @@ async fn run_remote_environment_connections<H: NoiseStreamHandler>(
                     },
                 )
                 .await;
+                backoff.connection_closed(connected_at.elapsed());
                 info!(
                     noise_event = "rendezvous_connection",
                     noise_outcome = "disconnected",
                     noise_reason = disconnect_reason.as_str(),
+                    request_id,
+                    connection_attempt,
                     "Noise executor disconnected from rendezvous"
                 );
                 config
@@ -692,13 +768,19 @@ async fn run_remote_environment_connections<H: NoiseStreamHandler>(
                     tokio_tungstenite::tungstenite::Error::Http(response)
                         if response.status().is_client_error()
                 );
+                let failure = connection_diagnostics::ConnectionFailure::from(&error);
                 warn!(
                     noise_event = "rendezvous_connection",
                     noise_outcome = "error",
                     noise_reason = "websocket_error",
+                    request_id,
+                    connection_attempt,
+                    error_kind = failure.error_kind,
+                    io_error_kind = failure.io_error_kind,
+                    http_status = failure.http_status,
+                    rejection_reason = failure.rejection_reason,
                     "Noise executor failed to connect to rendezvous"
                 );
-                debug!(error = %error, "Noise executor rendezvous connection error");
                 if registration_rejected {
                     config.telemetry.remote_reconnect("registration_rejected");
                     response = client
@@ -713,8 +795,7 @@ async fn run_remote_environment_connections<H: NoiseStreamHandler>(
             }
         }
 
-        sleep(backoff).await;
-        backoff = (backoff * 2).min(Duration::from_secs(30));
+        sleep(backoff.next_delay(uuid::Uuid::new_v4().as_u64_pair().1)).await;
     }
 }
 
@@ -724,18 +805,23 @@ async fn run_remote_environment_connections<H: NoiseStreamHandler>(
     fields(
         otel.kind = "client",
         otel.name = "codex.exec_server.remote.rendezvous.connect",
+        request_id = request_id,
         result = tracing::field::Empty,
     )
 )]
 async fn connect_rendezvous(
     url: &str,
+    request_id: &str,
     telemetry: &ExecServerTelemetry,
     http_client_factory: &HttpClientFactory,
 ) -> Result<WebSocketConnection, tokio_tungstenite::tungstenite::Error> {
     let started_at = Instant::now();
-    let result = async {
+    let result = tokio::time::timeout(DEFAULT_REMOTE_EXEC_SERVER_CONNECT_TIMEOUT, async {
         let mut request = url.into_client_request()?;
         request.headers_mut().extend(current_rendezvous_headers());
+        request
+            .headers_mut()
+            .insert("x-request-id", HeaderValue::from_str(request_id)?);
         let connector = WebSocketConnector::new_with_tls_mode(
             http_client_factory,
             WebSocketTlsMode::TungsteniteDefault,
@@ -746,8 +832,16 @@ async fn connect_rendezvous(
             .connect(request, noise_relay_websocket_config())
             .await
             .map(|(websocket, _)| websocket)
-    }
-    .await;
+    })
+    .await
+    .unwrap_or_else(|_| {
+        Err(tokio_tungstenite::tungstenite::Error::Io(
+            std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                "rendezvous websocket connection timed out",
+            ),
+        ))
+    });
     let result_name = if result.is_ok() { "success" } else { "error" };
     tracing::Span::current().record("result", result_name);
     telemetry.remote_rendezvous_completed(result_name, started_at.elapsed());
@@ -767,6 +861,15 @@ fn normalize_environment_id(environment_id: String) -> Result<String, ExecServer
 #[derive(Deserialize)]
 struct RegistryErrorBody {
     error: Option<RegistryError>,
+    detail: Option<serde_json::Value>,
+}
+
+impl RegistryErrorBody {
+    fn into_error(self) -> Option<RegistryError> {
+        // Keep the canonical error authoritative when both envelopes are present.
+        self.error
+            .or_else(|| serde_json::from_value(self.detail?).ok())
+    }
 }
 
 #[derive(Deserialize)]
@@ -799,7 +902,7 @@ fn environment_registry_auth_error(status: StatusCode, body: &str) -> ExecServer
 fn environment_registry_http_error(status: StatusCode, body: &str) -> ExecServerError {
     let parsed = serde_json::from_str::<RegistryErrorBody>(body).ok();
     let (code, message) = parsed
-        .and_then(|body| body.error)
+        .and_then(RegistryErrorBody::into_error)
         .map(|error| {
             (
                 error.code,
@@ -825,7 +928,7 @@ fn environment_registry_http_error(status: StatusCode, body: &str) -> ExecServer
 fn registry_error_message(body: &str) -> Option<String> {
     serde_json::from_str::<RegistryErrorBody>(body)
         .ok()
-        .and_then(|body| body.error)
+        .and_then(RegistryErrorBody::into_error)
         .and_then(|error| error.message)
         .or_else(|| preview_error_body(body))
 }
@@ -1203,6 +1306,33 @@ mod tests {
             config.http_client_factory.outbound_proxy_policy(),
             OutboundProxyPolicy::RespectSystemProxy
         );
+    }
+
+    #[test]
+    fn remote_environment_config_new_defaults_to_noise_transport() {
+        let config = RemoteEnvironmentConfig::new(
+            "https://registry.example".to_string(),
+            "env-1".to_string(),
+            static_registry_auth_provider(),
+            HttpClientFactory::new(OutboundProxyPolicy::ReqwestDefault),
+        )
+        .expect("config");
+
+        assert_eq!(config.transport, RemoteEnvironmentTransport::Noise);
+    }
+
+    #[test]
+    fn remote_environment_config_new_with_transport_preserves_direct_transport() {
+        let config = RemoteEnvironmentConfig::new_with_transport(
+            "https://registry.example".to_string(),
+            "env-1".to_string(),
+            RemoteEnvironmentTransport::Direct,
+            static_registry_auth_provider(),
+            HttpClientFactory::new(OutboundProxyPolicy::ReqwestDefault),
+        )
+        .expect("config");
+
+        assert_eq!(config.transport, RemoteEnvironmentTransport::Direct);
     }
 
     #[test]
